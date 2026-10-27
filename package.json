@@ -1,0 +1,23 @@
+{
+  "name": "smys-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local headless AI harness",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint apps packages tests",
+    "test": "npm run build && node --test dist/tests/application/*.test.js dist/tests/storage/*.test.js dist/tests/cli/*.test.js",
+    "precli": "npm run build",
+    "cli": "node dist/apps/cli/src/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "eslint": "^10.13.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1"
+  }
+}

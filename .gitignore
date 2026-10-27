@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.smys-agent/
+/data/
+sandbox/store.json
+.DS_Store
+templates
