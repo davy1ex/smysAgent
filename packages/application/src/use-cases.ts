@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Session, SessionHistory, SessionId, UserMessage } from "../../core/src/session";
+import { runAgentTurn as generateAgentReply, type TextGenerationProvider } from "../../core/src/agent-runtime";
+import type { AssistantMessage, Session, SessionHistory, SessionId, UserMessage } from "../../core/src/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
 import type { SessionRepository } from "./ports";
 
@@ -32,6 +33,25 @@ export async function sendMessage(
     throw new SessionNotFoundError(input.sessionId);
   }
   return message;
+}
+
+export async function runAgentTurn(
+  repository: SessionRepository,
+  provider: TextGenerationProvider,
+  input: { sessionId: SessionId; text: string },
+): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }> {
+  const userMessage = await sendMessage(repository, input);
+  const history = await getHistory(repository, input.sessionId);
+  const text = await generateAgentReply(history.messages, provider);
+  const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
+    id: randomUUID(),
+    createdAt: new Date().toISOString(),
+    text,
+  });
+  if (assistantMessage === null) {
+    throw new SessionNotFoundError(input.sessionId);
+  }
+  return { userMessage, assistantMessage };
 }
 
 export async function getHistory(

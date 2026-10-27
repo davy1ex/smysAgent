@@ -20,7 +20,18 @@ export interface UserMessage {
   createdAt: string;
 }
 
+export interface AssistantMessage {
+  id: MessageId;
+  sessionId: SessionId;
+  sequence: number;
+  role: "assistant";
+  content: [TextContentPart];
+  createdAt: string;
+}
+
+export type Message = UserMessage | AssistantMessage;
+
 export interface SessionHistory {
   session: Session;
-  messages: UserMessage[];
+  messages: Message[];
 }

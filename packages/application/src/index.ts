@@ -1,3 +1,3 @@
 export { InvalidArgumentError, SessionNotFoundError } from "./errors";
-export type { SessionRepository, UserMessageDraft } from "./ports";
-export { createSession, getHistory, sendMessage } from "./use-cases";
+export type { AssistantMessageDraft, SessionRepository, UserMessageDraft } from "./ports";
+export { createSession, getHistory, runAgentTurn, sendMessage } from "./use-cases";

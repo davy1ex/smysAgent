@@ -92,6 +92,45 @@ test("message send persists through the application API and CLI exposes stable e
   assert.equal((JSON.parse(invalidArgumentsProcess.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
 });
 
+test("fake agent turn persists an assistant reply for a separate history process", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-turn-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+
+  const createdProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(createdProcess.status, 0, createdProcess.stderr);
+  const created = JSON.parse(createdProcess.stdout) as { session: { id: string } };
+
+  const agentProcess = runCli(dataDir, [
+    "agent", "run", "--json", "--provider", "fake", "--session-id", created.session.id, "--text", "deterministic input",
+  ]);
+  assert.equal(agentProcess.status, 0, agentProcess.stderr);
+  const result = JSON.parse(agentProcess.stdout) as {
+    ok: boolean;
+    userMessage: { role: string; sequence: number; content: Array<{ text: string }> };
+    assistantMessage: { role: string; sequence: number; content: Array<{ text: string }> };
+  };
+  assert.equal(result.ok, true);
+  assert.equal(result.userMessage.role, "user");
+  assert.equal(result.userMessage.sequence, 1);
+  assert.equal(result.assistantMessage.role, "assistant");
+  assert.equal(result.assistantMessage.sequence, 2);
+  assert.deepEqual(result.assistantMessage.content, [{ type: "text", text: "Fake response to: deterministic input" }]);
+
+  const historyProcess = runCli(dataDir, ["history", "get", "--json", "--session-id", created.session.id]);
+  assert.equal(historyProcess.status, 0, historyProcess.stderr);
+  const history = JSON.parse(historyProcess.stdout) as {
+    messages: Array<{ role: string; sequence: number; content: Array<{ text: string }> }>;
+  };
+  assert.deepEqual(history.messages.map((message) => [message.role, message.sequence, message.content[0]?.text]), [
+    ["user", 1, "deterministic input"],
+    ["assistant", 2, "Fake response to: deterministic input"],
+  ]);
+
+  const implicitProviderProcess = runCli(dataDir, ["agent", "run", "--json", "--session-id", created.session.id, "--text", "no implicit fake"]);
+  assert.equal(implicitProviderProcess.status, 2);
+  assert.equal((JSON.parse(implicitProviderProcess.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
+});
+
 test("default storage is under the launch directory and survives another CLI process", async (t) => {
   const launchDir = await mkdtemp(join(tmpdir(), "smys-agent-cwd-"));
   t.after(async () => rm(launchDir, { recursive: true, force: true }));

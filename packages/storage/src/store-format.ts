@@ -1,11 +1,20 @@
-import type { Session, SessionHistory, UserMessage } from "../../core/src/session";
+import type { AssistantMessage, Message, Session, SessionHistory, UserMessage } from "../../core/src/session";
 
-export const STORE_FORMAT_VERSION = 1;
+export const STORE_FORMAT_VERSION = 2;
+export const LEGACY_STORE_FORMAT_VERSION = 1;
 
 export interface StoreDocument {
   formatVersion: typeof STORE_FORMAT_VERSION;
   sessions: Session[];
+  messages: Message[];
+  [key: string]: unknown;
+}
+
+export interface LegacyStoreDocument {
+  formatVersion: typeof LEGACY_STORE_FORMAT_VERSION;
+  sessions: Session[];
   messages: UserMessage[];
+  [key: string]: unknown;
 }
 
 export function emptyStore(): StoreDocument {
@@ -17,13 +26,34 @@ export function emptyStore(): StoreDocument {
 }
 
 export function isStoreDocument(value: unknown): value is StoreDocument {
+  return isStoreWithMessages(value, STORE_FORMAT_VERSION, isMessage);
+}
+
+export function isLegacyStoreDocument(value: unknown): value is LegacyStoreDocument {
+  return isStoreWithMessages(value, LEGACY_STORE_FORMAT_VERSION, isUserMessage);
+}
+
+export function migrateV1ToV2(store: LegacyStoreDocument): StoreDocument {
+  return {
+    ...store,
+    formatVersion: STORE_FORMAT_VERSION,
+    sessions: store.sessions,
+    messages: store.messages,
+  };
+}
+
+function isStoreWithMessages<T extends Message>(
+  value: unknown,
+  version: number,
+  isValidMessage: (value: unknown) => value is T,
+): boolean {
   if (typeof value !== "object" || value === null) {
     return false;
   }
 
   const candidate = value as Record<string, unknown>;
   if (
-    candidate.formatVersion !== STORE_FORMAT_VERSION ||
+    candidate.formatVersion !== version ||
     !Array.isArray(candidate.sessions) ||
     !Array.isArray(candidate.messages)
   ) {
@@ -32,7 +62,7 @@ export function isStoreDocument(value: unknown): value is StoreDocument {
 
   const sessions = candidate.sessions;
   const messages = candidate.messages;
-  if (!sessions.every(isSession) || !messages.every(isUserMessage)) {
+  if (!sessions.every(isSession) || !messages.every(isValidMessage)) {
     return false;
   }
 
@@ -68,6 +98,16 @@ function isSession(value: unknown): value is Session {
 }
 
 function isUserMessage(value: unknown): value is UserMessage {
+  return isMessageForRole(value, "user");
+}
+
+function isMessage(value: unknown): value is Message {
+  return isMessageForRole(value, "user") || isMessageForRole(value, "assistant");
+}
+
+function isMessageForRole(value: unknown, role: "user"): value is UserMessage;
+function isMessageForRole(value: unknown, role: "assistant"): value is AssistantMessage;
+function isMessageForRole(value: unknown, role: "user" | "assistant"): value is Message {
   if (typeof value !== "object" || value === null) {
     return false;
   }
@@ -78,7 +118,7 @@ function isUserMessage(value: unknown): value is UserMessage {
     typeof candidate.sessionId !== "string" ||
     !Number.isInteger(candidate.sequence) ||
     (candidate.sequence as number) < 1 ||
-    candidate.role !== "user" ||
+    candidate.role !== role ||
     typeof candidate.createdAt !== "string" ||
     !Array.isArray(candidate.content) ||
     candidate.content.length !== 1
@@ -89,7 +129,7 @@ function isUserMessage(value: unknown): value is UserMessage {
   return content?.type === "text" && typeof content.text === "string";
 }
 
-export function toHistory(session: Session, messages: UserMessage[]): SessionHistory {
+export function toHistory(session: Session, messages: Message[]): SessionHistory {
   return {
     session,
     messages: messages

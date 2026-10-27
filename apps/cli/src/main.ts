@@ -3,14 +3,16 @@ import {
   createSession,
   getHistory,
   InvalidArgumentError,
+  runAgentTurn,
   sendMessage,
   SessionNotFoundError,
   type SessionRepository,
 } from "../../../packages/application/src";
 import { JsonFileSessionRepository, StorageError } from "../../../packages/storage/src";
+import { FakeProvider } from "../../../packages/providers/src/fake-provider";
 
 type ParsedCommand = {
-  command: "session-create" | "message-send" | "history-get";
+  command: "session-create" | "message-send" | "history-get" | "agent-run";
   json: boolean;
   options: Map<string, string>;
 };
@@ -50,8 +52,10 @@ function parseCommand(argv: string[]): ParsedCommand {
     command = "message-send";
   } else if (group === "history" && action === "get") {
     command = "history-get";
+  } else if (group === "agent" && action === "run") {
+    command = "agent-run";
   } else {
-    throw new InvalidArgumentError("Expected: session create, message send, or history get.");
+    throw new InvalidArgumentError("Expected: session create, message send, history get, or agent run.");
   }
 
   const allowedOptions = new Set(
@@ -59,7 +63,9 @@ function parseCommand(argv: string[]): ParsedCommand {
       ? ["data-dir", "initial-message"]
       : command === "message-send"
         ? ["data-dir", "session-id", "text"]
-        : ["data-dir", "session-id"],
+        : command === "agent-run"
+          ? ["data-dir", "session-id", "text", "provider"]
+          : ["data-dir", "session-id"],
   );
   const options = new Map<string, string>();
   let json = false;
@@ -94,13 +100,16 @@ function parseCommand(argv: string[]): ParsedCommand {
   if (command !== "session-create" && !options.has("session-id")) {
     throw new InvalidArgumentError("--session-id is required.");
   }
-  if (command === "message-send" && !options.has("text")) {
+  if ((command === "message-send" || command === "agent-run") && !options.has("text")) {
     throw new InvalidArgumentError("--text is required.");
+  }
+  if (command === "agent-run" && options.get("provider") !== "fake") {
+    throw new InvalidArgumentError("agent run requires --provider fake.");
   }
   if (command === "session-create" && options.get("initial-message") === "") {
     throw new InvalidArgumentError("--initial-message must not be empty.");
   }
-  if (command === "message-send" && options.get("text") === "") {
+  if ((command === "message-send" || command === "agent-run") && options.get("text") === "") {
     throw new InvalidArgumentError("--text must not be empty.");
   }
   return { command, json, options };
@@ -131,6 +140,17 @@ async function execute(
       const sessionId = requiredOption(parsed.options, "session-id");
       const history = await getHistory(repository, sessionId);
       return { ok: true, sessionId, messages: history.messages };
+    }
+    case "agent-run": {
+      const turn = await runAgentTurn(
+        repository,
+        new FakeProvider(),
+        {
+          sessionId: requiredOption(parsed.options, "session-id"),
+          text: requiredOption(parsed.options, "text"),
+        },
+      );
+      return { ok: true, ...turn };
     }
   }
 }
@@ -200,6 +220,12 @@ function writeSuccess(value: Record<string, unknown>, json: boolean): void {
   if ("message" in value && typeof value.message === "object" && value.message !== null) {
     const message = value.message as { id?: unknown };
     process.stdout.write(`Saved message ${String(message.id)}\n`);
+    return;
+  }
+  if ("assistantMessage" in value && typeof value.assistantMessage === "object" && value.assistantMessage !== null) {
+    const turn = value as { userMessage: { id: string }; assistantMessage: { content: Array<{ text: string }> } };
+    process.stdout.write(`Saved user message ${turn.userMessage.id}\n`);
+    process.stdout.write(`${turn.assistantMessage.content.map((part) => part.text).join("\n")}\n`);
     return;
   }
   if ("sessionId" in value && Array.isArray(value.messages)) {
