@@ -10,6 +10,9 @@ import {
 } from "../../../packages/application/src";
 import { JsonFileSessionRepository, StorageError } from "../../../packages/storage/src";
 import { FakeProvider } from "../../../packages/providers/src/fake-provider";
+import { LmStudioProvider, LmStudioProviderError } from "../../../packages/providers/src/lm-studio-provider";
+
+const DEFAULT_LM_STUDIO_ENDPOINT = "http://localhost:1234/v1/chat/completions";
 
 type ParsedCommand = {
   command: "session-create" | "message-send" | "history-get" | "agent-run";
@@ -27,10 +30,11 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   try {
     const parsed = parseCommand(argv);
     json = parsed.json;
+    validateProviderSettings(parsed, env);
     const dataDir = resolveDataDir(parsed.options.get("data-dir"), env);
     const repository = new JsonFileSessionRepository(dataDir);
     try {
-      const result = await execute(parsed, repository);
+      const result = await execute(parsed, repository, env);
       writeSuccess(result, parsed.json);
       return 0;
     } finally {
@@ -64,7 +68,7 @@ function parseCommand(argv: string[]): ParsedCommand {
       : command === "message-send"
         ? ["data-dir", "session-id", "text"]
         : command === "agent-run"
-          ? ["data-dir", "session-id", "text", "provider"]
+          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint"]
           : ["data-dir", "session-id"],
   );
   const options = new Map<string, string>();
@@ -103,8 +107,22 @@ function parseCommand(argv: string[]): ParsedCommand {
   if ((command === "message-send" || command === "agent-run") && !options.has("text")) {
     throw new InvalidArgumentError("--text is required.");
   }
-  if (command === "agent-run" && options.get("provider") !== "fake") {
-    throw new InvalidArgumentError("agent run requires --provider fake.");
+  if (command === "agent-run" && options.get("provider") !== "fake" && options.get("provider") !== "lm-studio") {
+    throw new InvalidArgumentError("agent run requires --provider fake or lm-studio.");
+  }
+  if (command === "agent-run" && options.get("provider") === "lm-studio") {
+    if (!options.has("model")) {
+      throw new InvalidArgumentError("--model is required when --provider lm-studio is selected.");
+    }
+    if (options.get("model") === "") {
+      throw new InvalidArgumentError("--model must not be empty.");
+    }
+    if (options.get("endpoint") === "") {
+      throw new InvalidArgumentError("--endpoint must not be empty.");
+    }
+  }
+  if (command === "agent-run" && options.get("provider") === "fake" && (options.has("model") || options.has("endpoint"))) {
+    throw new InvalidArgumentError("--model and --endpoint can only be used with --provider lm-studio.");
   }
   if (command === "session-create" && options.get("initial-message") === "") {
     throw new InvalidArgumentError("--initial-message must not be empty.");
@@ -118,6 +136,7 @@ function parseCommand(argv: string[]): ParsedCommand {
 async function execute(
   parsed: ParsedCommand,
   repository: SessionRepository,
+  env: NodeJS.ProcessEnv,
 ): Promise<Record<string, unknown>> {
   switch (parsed.command) {
     case "session-create": {
@@ -142,9 +161,19 @@ async function execute(
       return { ok: true, sessionId, messages: history.messages };
     }
     case "agent-run": {
+      const providerName = requiredOption(parsed.options, "provider");
+      const provider = providerName === "fake"
+        ? new FakeProvider()
+        : new LmStudioProvider({
+          endpoint: resolveLmStudioEndpoint(parsed.options.get("endpoint"), env),
+          model: requiredOption(parsed.options, "model"),
+          ...(env.LM_API_TOKEN !== undefined && env.LM_API_TOKEN.trim().length > 0
+            ? { apiToken: env.LM_API_TOKEN.trim() }
+            : {}),
+        });
       const turn = await runAgentTurn(
         repository,
-        new FakeProvider(),
+        provider,
         {
           sessionId: requiredOption(parsed.options, "session-id"),
           text: requiredOption(parsed.options, "text"),
@@ -153,6 +182,33 @@ async function execute(
       return { ok: true, ...turn };
     }
   }
+}
+
+function validateProviderSettings(parsed: ParsedCommand, env: NodeJS.ProcessEnv): void {
+  if (parsed.command !== "agent-run" || parsed.options.get("provider") !== "lm-studio") {
+    return;
+  }
+
+  const endpoint = resolveLmStudioEndpoint(parsed.options.get("endpoint"), env);
+  let parsedEndpoint: URL;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch {
+    throw new InvalidArgumentError("--endpoint must be an absolute HTTP or HTTPS URL.");
+  }
+  if (parsedEndpoint.protocol !== "http:" && parsedEndpoint.protocol !== "https:") {
+    throw new InvalidArgumentError("--endpoint must be an absolute HTTP or HTTPS URL.");
+  }
+}
+
+function resolveLmStudioEndpoint(option: string | undefined, env: NodeJS.ProcessEnv): string {
+  if (option !== undefined) {
+    return option;
+  }
+  const configuredEndpoint = env.LM_STUDIO_ENDPOINT;
+  return configuredEndpoint === undefined || configuredEndpoint.length === 0
+    ? DEFAULT_LM_STUDIO_ENDPOINT
+    : configuredEndpoint;
 }
 
 function requiredOption(options: Map<string, string>, name: string): string {
@@ -187,6 +243,9 @@ function toCliError(error: unknown): CliErrorPayload {
   }
   if (error instanceof StorageError) {
     return { code: "STORAGE_ERROR", message: error.message };
+  }
+  if (error instanceof LmStudioProviderError) {
+    return { code: "INTERNAL_ERROR", message: error.message };
   }
   return { code: "INTERNAL_ERROR", message: "An unexpected error occurred." };
 }

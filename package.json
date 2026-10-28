@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint apps packages tests",
-    "test": "npm run build && node --test dist/tests/application/*.test.js dist/tests/storage/*.test.js dist/tests/cli/*.test.js",
+    "test": "npm run build && node --test dist/tests/application/*.test.js dist/tests/storage/*.test.js dist/tests/providers/*.test.js dist/tests/cli/*.test.js",
     "precli": "npm run build",
     "cli": "node dist/apps/cli/src/main.js"
   },

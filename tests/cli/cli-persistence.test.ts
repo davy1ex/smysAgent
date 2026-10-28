@@ -1,17 +1,44 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const cliPath = resolve(__dirname, "../../apps/cli/src/main.js");
 
-function runCli(dataDir: string, args: string[]) {
+function runCli(dataDir: string, args: string[], envOverrides: NodeJS.ProcessEnv = {}) {
   return spawnSync(process.execPath, [cliPath, ...args, "--data-dir", dataDir], {
     encoding: "utf8",
-    env: { ...process.env },
+    env: childEnvironment(envOverrides),
   });
+}
+
+function runCliAsync(dataDir: string, args: string[], envOverrides: NodeJS.ProcessEnv = {}): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}> {
+  return new Promise((resolveProcess, rejectProcess) => {
+    const child = spawn(process.execPath, [cliPath, ...args, "--data-dir", dataDir], {
+      env: childEnvironment(envOverrides),
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", rejectProcess);
+    child.once("close", (status) => resolveProcess({ status, stdout, stderr }));
+  });
+}
+
+function childEnvironment(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...overrides };
+  if (!Object.prototype.hasOwnProperty.call(overrides, "LM_API_TOKEN")) {
+    delete env.LM_API_TOKEN;
+  }
+  return env;
 }
 
 function runCliFrom(cwd: string, args: string[], envDataDir?: string) {
@@ -28,6 +55,48 @@ async function readStore(dataDir: string): Promise<{ sessions: Array<{ id: strin
   return JSON.parse(await readFile(join(dataDir, "store.json"), "utf8")) as {
     sessions: Array<{ id: string }>;
     messages: unknown[];
+  };
+}
+
+async function startLmStudioStub(status: number, payload: unknown): Promise<{
+  endpoint: string;
+  requests: Array<{ method: string | undefined; path: string | undefined; authorization: string | undefined; body: unknown }>;
+  close: () => Promise<void>;
+}> {
+  const requests: Array<{
+    method: string | undefined;
+    path: string | undefined;
+    authorization: string | undefined;
+    body: unknown;
+  }> = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown,
+      });
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload));
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Could not determine the local test server address.");
+  }
+  return {
+    endpoint: `http://127.0.0.1:${address.port}/v1/chat/completions`,
+    requests,
+    close: () => new Promise<void>((resolveClose, rejectClose) => {
+      server.close((error) => error === undefined ? resolveClose() : rejectClose(error));
+    }),
   };
 }
 
@@ -129,6 +198,110 @@ test("fake agent turn persists an assistant reply for a separate history process
   const implicitProviderProcess = runCli(dataDir, ["agent", "run", "--json", "--session-id", created.session.id, "--text", "no implicit fake"]);
   assert.equal(implicitProviderProcess.status, 2);
   assert.equal((JSON.parse(implicitProviderProcess.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
+
+  const missingModelProcess = runCli(dataDir, [
+    "agent", "run", "--json", "--provider", "lm-studio", "--session-id", created.session.id, "--text", "missing model",
+  ]);
+  assert.equal(missingModelProcess.status, 2);
+  assert.equal((JSON.parse(missingModelProcess.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
+});
+
+test("LM Studio CLI turns persist and a separate history process reads them", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-lm-studio-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const stub = await startLmStudioStub(200, {
+    choices: [{ message: { role: "assistant", content: "stubbed model reply" } }],
+  });
+  t.after(stub.close);
+
+  const createdProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(createdProcess.status, 0, createdProcess.stderr);
+  const created = JSON.parse(createdProcess.stdout) as { session: { id: string } };
+
+  const firstRun = await runCliAsync(dataDir, [
+    "agent", "run", "--json", "--provider", "lm-studio", "--model", "publisher/model-id",
+    "--endpoint", stub.endpoint, "--session-id", created.session.id, "--text", "first LM Studio request",
+  ], {
+    LM_STUDIO_ENDPOINT: "http://127.0.0.1:1/unused",
+    LM_API_TOKEN: "mock-token",
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const secondRun = await runCliAsync(dataDir, [
+    "agent", "run", "--json", "--provider", "lm-studio", "--model", "publisher/model-id",
+    "--session-id", created.session.id, "--text", "second LM Studio request",
+  ], { LM_STUDIO_ENDPOINT: stub.endpoint });
+  assert.equal(secondRun.status, 0, secondRun.stderr);
+
+  assert.deepEqual(stub.requests.map(({ method, path, body }) => ({ method, path, body })), [
+    {
+      method: "POST",
+      path: "/v1/chat/completions",
+      body: {
+        model: "publisher/model-id",
+        messages: [{ role: "user", content: "first LM Studio request" }],
+        stream: false,
+      },
+    },
+    {
+      method: "POST",
+      path: "/v1/chat/completions",
+      body: {
+        model: "publisher/model-id",
+        messages: [
+          { role: "user", content: "first LM Studio request" },
+          { role: "assistant", content: "stubbed model reply" },
+          { role: "user", content: "second LM Studio request" },
+        ],
+        stream: false,
+      },
+    },
+  ]);
+  assert.equal(stub.requests[0]?.authorization, "Bearer mock-token");
+  assert.equal(stub.requests[1]?.authorization, undefined);
+
+  const historyProcess = await runCliAsync(dataDir, ["history", "get", "--json", "--session-id", created.session.id]);
+  assert.equal(historyProcess.status, 0, historyProcess.stderr);
+  const history = JSON.parse(historyProcess.stdout) as {
+    messages: Array<{ role: string; sequence: number; content: Array<{ text: string }> }>;
+  };
+  assert.deepEqual(history.messages.map((message) => [message.role, message.sequence, message.content[0]?.text]), [
+    ["user", 1, "first LM Studio request"],
+    ["assistant", 2, "stubbed model reply"],
+    ["user", 3, "second LM Studio request"],
+    ["assistant", 4, "stubbed model reply"],
+  ]);
+});
+
+test("LM Studio HTTP failure uses the CLI error contract and leaves the user message in history", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-lm-studio-error-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const stub = await startLmStudioStub(503, { error: "private server response" });
+  t.after(stub.close);
+
+  const createdProcess = await runCliAsync(dataDir, ["session", "create", "--json"]);
+  assert.equal(createdProcess.status, 0, createdProcess.stderr);
+  const created = JSON.parse(createdProcess.stdout) as { session: { id: string } };
+
+  const runProcess = await runCliAsync(dataDir, [
+    "agent", "run", "--json", "--provider", "lm-studio", "--model", "publisher/model-id",
+    "--endpoint", stub.endpoint, "--session-id", created.session.id, "--text", "request that fails",
+  ]);
+  assert.equal(runProcess.status, 1);
+  assert.deepEqual(JSON.parse(runProcess.stderr), {
+    ok: false,
+    error: { code: "INTERNAL_ERROR", message: "LM Studio returned HTTP 503." },
+  });
+  assert.equal(runProcess.stderr.includes("private server response"), false);
+
+  const historyProcess = await runCliAsync(dataDir, ["history", "get", "--json", "--session-id", created.session.id]);
+  assert.equal(historyProcess.status, 0, historyProcess.stderr);
+  const history = JSON.parse(historyProcess.stdout) as {
+    messages: Array<{ role: string; content: Array<{ text: string }> }>;
+  };
+  assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
+    ["user", "request that fails"],
+  ]);
 });
 
 test("default storage is under the launch directory and survives another CLI process", async (t) => {
