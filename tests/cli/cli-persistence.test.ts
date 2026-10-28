@@ -206,6 +206,44 @@ test("fake agent turn persists an assistant reply for a separate history process
   assert.equal((JSON.parse(missingModelProcess.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
 });
 
+test("CLI fake smoke explicitly enables and permits demo.add", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-demo-add-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+
+  const createdProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(createdProcess.status, 0, createdProcess.stderr);
+  const created = JSON.parse(createdProcess.stdout) as { session: { id: string } };
+  const runProcess = runCli(dataDir, [
+    "agent", "run", "--json", "--provider", "fake", "--session-id", created.session.id,
+    "--text", "smoke demo.add", "--tool", "demo.add", "--allow-tool", "demo.add",
+  ]);
+
+  assert.equal(runProcess.status, 0, runProcess.stderr);
+  const result = JSON.parse(runProcess.stdout) as {
+    assistantMessage: { role: string; content: Array<{ text: string }> };
+  };
+  assert.equal(result.assistantMessage.role, "assistant");
+  assert.deepEqual(result.assistantMessage.content, [{ type: "text", text: "Fake demo.add result: 5" }]);
+
+  const deniedSessionProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(deniedSessionProcess.status, 0, deniedSessionProcess.stderr);
+  const deniedSession = JSON.parse(deniedSessionProcess.stdout) as { session: { id: string } };
+  const deniedRun = runCli(dataDir, [
+    "agent", "run", "--json", "--provider", "fake", "--session-id", deniedSession.session.id,
+    "--text", "smoke demo.add without permission", "--tool", "demo.add",
+  ]);
+
+  assert.equal(deniedRun.status, 1);
+  assert.deepEqual(JSON.parse(deniedRun.stderr), {
+    ok: false,
+    error: { code: "INTERNAL_ERROR", message: "The tool call was denied." },
+  });
+  const historyProcess = runCli(dataDir, ["history", "get", "--json", "--session-id", deniedSession.session.id]);
+  assert.equal(historyProcess.status, 0, historyProcess.stderr);
+  const history = JSON.parse(historyProcess.stdout) as { messages: Array<{ role: string }> };
+  assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
+});
+
 test("LM Studio CLI turns persist and a separate history process reads them", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-lm-studio-"));
   t.after(async () => rm(dataDir, { recursive: true, force: true }));

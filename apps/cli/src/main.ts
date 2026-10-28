@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { AgentRuntimeError, type ToolPermissionPolicy } from "../../../packages/core/src/agent-runtime";
 import {
   createSession,
   getHistory,
@@ -11,8 +12,13 @@ import {
 import { JsonFileSessionRepository, StorageError } from "../../../packages/storage/src";
 import { FakeProvider } from "../../../packages/providers/src/fake-provider";
 import { LmStudioProvider, LmStudioProviderError } from "../../../packages/providers/src/lm-studio-provider";
+import { createDemoAddTool } from "./demo-tools";
 
 const DEFAULT_LM_STUDIO_ENDPOINT = "http://localhost:1234/v1/chat/completions";
+const FAKE_DEMO_ADD_RESPONSES = [
+  { kind: "tool-call", callId: "fake-demo-add", name: "demo.add", arguments: { a: 2, b: 3 } },
+  { kind: "final", text: "Fake demo.add result: 5" },
+] as const;
 
 type ParsedCommand = {
   command: "session-create" | "message-send" | "history-get" | "agent-run";
@@ -68,7 +74,7 @@ function parseCommand(argv: string[]): ParsedCommand {
       : command === "message-send"
         ? ["data-dir", "session-id", "text"]
         : command === "agent-run"
-          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint"]
+          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint", "tool", "allow-tool"]
           : ["data-dir", "session-id"],
   );
   const options = new Map<string, string>();
@@ -124,6 +130,15 @@ function parseCommand(argv: string[]): ParsedCommand {
   if (command === "agent-run" && options.get("provider") === "fake" && (options.has("model") || options.has("endpoint"))) {
     throw new InvalidArgumentError("--model and --endpoint can only be used with --provider lm-studio.");
   }
+  if (command === "agent-run" && options.has("tool") && options.get("tool") !== "demo.add") {
+    throw new InvalidArgumentError("--tool supports only demo.add.");
+  }
+  if (command === "agent-run" && options.has("allow-tool") && options.get("allow-tool") !== "demo.add") {
+    throw new InvalidArgumentError("--allow-tool supports only demo.add.");
+  }
+  if (command === "agent-run" && options.has("allow-tool") && !options.has("tool")) {
+    throw new InvalidArgumentError("--allow-tool requires --tool demo.add.");
+  }
   if (command === "session-create" && options.get("initial-message") === "") {
     throw new InvalidArgumentError("--initial-message must not be empty.");
   }
@@ -162,8 +177,9 @@ async function execute(
     }
     case "agent-run": {
       const providerName = requiredOption(parsed.options, "provider");
+      const demoAddEnabled = parsed.options.get("tool") === "demo.add";
       const provider = providerName === "fake"
-        ? new FakeProvider()
+        ? new FakeProvider(demoAddEnabled ? FAKE_DEMO_ADD_RESPONSES : [])
         : new LmStudioProvider({
           endpoint: resolveLmStudioEndpoint(parsed.options.get("endpoint"), env),
           model: requiredOption(parsed.options, "model"),
@@ -171,6 +187,12 @@ async function execute(
             ? { apiToken: env.LM_API_TOKEN.trim() }
             : {}),
         });
+      const agentOptions = demoAddEnabled
+        ? {
+          tools: [createDemoAddTool()],
+          permissionPolicy: createCliPermissionPolicy(parsed.options),
+        }
+        : {};
       const turn = await runAgentTurn(
         repository,
         provider,
@@ -178,10 +200,19 @@ async function execute(
           sessionId: requiredOption(parsed.options, "session-id"),
           text: requiredOption(parsed.options, "text"),
         },
+        agentOptions,
       );
       return { ok: true, ...turn };
     }
   }
+}
+
+function createCliPermissionPolicy(options: Map<string, string>): ToolPermissionPolicy {
+  return {
+    async authorize(request) {
+      return options.get("allow-tool") === request.toolName ? "allow" : "deny";
+    },
+  };
 }
 
 function validateProviderSettings(parsed: ParsedCommand, env: NodeJS.ProcessEnv): void {
@@ -245,6 +276,9 @@ function toCliError(error: unknown): CliErrorPayload {
     return { code: "STORAGE_ERROR", message: error.message };
   }
   if (error instanceof LmStudioProviderError) {
+    return { code: "INTERNAL_ERROR", message: error.message };
+  }
+  if (error instanceof AgentRuntimeError) {
     return { code: "INTERNAL_ERROR", message: error.message };
   }
   return { code: "INTERNAL_ERROR", message: "An unexpected error occurred." };

@@ -4,7 +4,7 @@
 
 ## Состояние
 
-Реализован headless CLI-срез: создание сессии, сохранение сообщения без вызова модели, текстовый ход через явно выбранный fake или LM Studio provider и чтение истории из JSON-файлового хранилища новым процессом. Application API и core также поддерживают ограниченный agent loop с одним переданным инструментом, проверкой разрешений и максимум двумя вызовами модели. UI, проекты, worker и knowledge-функции не реализованы.
+Реализован headless CLI-срез: создание сессии, сохранение сообщения без вызова модели, текстовый ход через явно выбранный fake или LM Studio provider и чтение истории из JSON-файлового хранилища новым процессом. Application API и core также поддерживают ограниченный agent loop с одним переданным инструментом, проверкой разрешений и максимум двумя вызовами модели. CLI по умолчанию работает без инструментов; безопасный `demo.add` подключается и разрешается отдельными флагами. UI, проекты, worker и knowledge-функции не реализованы.
 
 ## Документация
 
@@ -48,9 +48,16 @@ npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_I
 # Выполнить один текстовый запрос через LM Studio.
 npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
 
+# Явно подключить demo.add и разрешить её исполнение через fake provider.
+npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_ID> --text "smoke demo.add" --tool demo.add --allow-tool demo.add
+
+# Попросить LM Studio вызвать demo.add с разрешёнными аргументами.
+npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Use demo.add with a=2 and b=3, then report the result." --tool demo.add --allow-tool demo.add
 ```
 
-`agent run` требует явный `--provider fake` или `--provider lm-studio`; `--model` обязателен для LM Studio. Fake не обращается к сети. LM Studio выполняет один обычный запрос без streaming и инструментов. Настройка endpoint и токена, формы JSON и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
+`agent run` требует явный `--provider fake` или `--provider lm-studio`; `--model` обязателен для LM Studio. Fake не обращается к сети. Без `--tool` CLI не передаёт инструменты. `--tool demo.add` подключает единственный встроенный инструмент, а `--allow-tool demo.add` отдельно разрешает его исполнение. Fake smoke детерминированно вызывает `demo.add(2, 3)`. Настройка endpoint и токена, формы JSON и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
+
+Инструмент доступен в CLI только при явной передаче обоих флагов `--tool demo.add` и `--allow-tool demo.add`.
 
 ### Ручная проверка LM Studio
 

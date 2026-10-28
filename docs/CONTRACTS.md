@@ -18,9 +18,9 @@ Application API — внутренний интерфейс use cases, чере�
 
 Сейчас эти use cases вызывает CLI; тесты могут вызывать их напрямую с подменёнными портами. Будущий web host должен использовать те же use cases. Если он окажется в отдельном процессе, HTTP adapter может преобразовать запросы в application commands; такого adapter сейчас нет.
 
-CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход через явно выбранный fake или LM Studio provider и чтение истории. CLI выполняет `agent run` без инструментов. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
+CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход через явно выбранный fake или LM Studio provider и чтение истории. По умолчанию CLI не передаёт инструменты; для smoke-сценария можно явно подключить встроенный `demo.add` и отдельно разрешить его исполнение. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
 
-CLI не содержит собственной реализации agent loop и вызывает application use case без инструментов. Ограниченный runtime проверяет имя инструмента, аргументы и разрешение до исполнения для application callers, которые передают инструмент и policy. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
+CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
 Открытыми остаются форма streaming-событий, протокол HTTP (если понадобится), размещение web/backend по процессам и расширение сохранённой схемы.
 
@@ -51,7 +51,7 @@ interface TextGenerationProvider {
 }
 ```
 
-`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Application callers могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -61,8 +61,8 @@ interface TextGenerationProvider {
 session create [--initial-message <text>] [--data-dir <path>] [--json]
 message send --session-id <id> --text <text> [--data-dir <path>] [--json]
 history get --session-id <id> [--data-dir <path>] [--json]
-agent run --provider fake --session-id <id> --text <text> [--data-dir <path>] [--json]
-agent run --provider lm-studio --model <model-id> --session-id <id> --text <text> [--endpoint <url>] [--data-dir <path>] [--json]
+agent run --provider fake --session-id <id> --text <text> [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json]
+agent run --provider lm-studio --model <model-id> --session-id <id> --text <text> [--endpoint <url>] [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json]
 ```
 
 `session create --initial-message <text>` вызывает application use case создания сессии и затем use case сохранения сообщения. Эта форма нужна в том числе для процессной проверки: один запуск CLI создаёт сессию и сохраняет сообщение, следующий отдельный запуск читает историю.
@@ -79,7 +79,7 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 
 Каждый ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища. Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. Без `--json` используются краткие текстовые сообщения.
 
-`agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках.
+`agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
 
 Ручной provider smoke test выполняется командой `npm run smoke:lm-studio`; она требует `LM_STUDIO_MODEL`, использует `LM_STUDIO_ENDPOINT` или стандартный endpoint и при наличии передаёт `LM_API_TOKEN`. Команда делает один non-streaming текстовый запрос и возвращает JSON в stdout/stderr. Она не входит в `npm test` и требует запущенный локальный LM Studio server.
 
