@@ -4,7 +4,7 @@
 
 ## Состояние
 
-Реализован headless CLI-срез: создание сессии, сохранение сообщения без вызова модели, один текстовый ход через явно выбранный fake или LM Studio provider и чтение истории из JSON-файлового хранилища новым процессом. Это не полноценный agent loop: инструменты, UI, проекты, worker и knowledge-функции пока не реализованы.
+Реализован headless CLI-срез: создание сессии, сохранение сообщения без вызова модели, текстовый ход через явно выбранный fake или LM Studio provider и чтение истории из JSON-файлового хранилища новым процессом. Application API и core также поддерживают ограниченный agent loop с одним переданным инструментом, проверкой разрешений и максимум двумя вызовами модели. UI, проекты, worker и knowledge-функции не реализованы.
 
 ## Документация
 
@@ -47,9 +47,21 @@ npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_I
 
 # Выполнить один текстовый запрос через LM Studio.
 npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
+
 ```
 
 `agent run` требует явный `--provider fake` или `--provider lm-studio`; `--model` обязателен для LM Studio. Fake не обращается к сети. LM Studio выполняет один обычный запрос без streaming и инструментов. Настройка endpoint и токена, формы JSON и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
+
+### Ручная проверка LM Studio
+
+Загрузите модель в LM Studio и включите Local Server. В fish задайте её точный ID и запустите проверку:
+
+```fish
+set -x LM_STUDIO_MODEL liquid/lfm2.5-1.2b
+npm run smoke:lm-studio
+```
+
+Endpoint по умолчанию — `http://localhost:1234/v1/chat/completions`; его можно переопределить через `LM_STUDIO_ENDPOINT`. Этот smoke test обращается к живому локальному серверу и не входит в `npm test`.
 
 ### Проверка сохранения между процессами
 

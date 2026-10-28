@@ -12,7 +12,9 @@
     "lint": "eslint apps packages tests",
     "test": "npm run build && node --test dist/tests/application/*.test.js dist/tests/storage/*.test.js dist/tests/providers/*.test.js dist/tests/cli/*.test.js",
     "precli": "npm run build",
-    "cli": "node dist/apps/cli/src/main.js"
+    "cli": "node dist/apps/cli/src/main.js",
+    "presmoke:lm-studio": "npm run build",
+    "smoke:lm-studio": "node dist/apps/cli/src/smoke-lm-studio.js"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

@@ -1,5 +1,10 @@
-import type { TextGenerationProvider } from "../../core/src/agent-runtime";
-import type { Message } from "../../core/src/session";
+import type {
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  TextGenerationProvider,
+  ToolDefinition,
+} from "../../core/src/agent-runtime";
 
 export interface LmStudioProviderOptions {
   endpoint: string;
@@ -22,25 +27,27 @@ export class LmStudioProvider implements TextGenerationProvider {
     this.fetcher = options.fetcher ?? fetch;
   }
 
-  async generate(messages: readonly Message[]): Promise<string> {
+  async generate(request: ModelRequest): Promise<ModelResponse> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.options.apiToken !== undefined && this.options.apiToken.length > 0) {
       headers.authorization = `Bearer ${this.options.apiToken}`;
     }
+
+    const body = {
+      model: this.options.model,
+      messages: request.messages.map(toLmStudioMessage),
+      stream: false,
+      ...(request.tools.length > 0
+        ? { tools: request.tools.map(toLmStudioTool), tool_choice: "auto" }
+        : {}),
+    };
 
     let response: Response;
     try {
       response = await this.fetcher(this.options.endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify({
-          model: this.options.model,
-          messages: messages.map((message) => ({
-            role: message.role,
-            content: message.content[0].text,
-          })),
-          stream: false,
-        }),
+        body: JSON.stringify(body),
       });
     } catch {
       throw new LmStudioProviderError("Could not connect to LM Studio.");
@@ -57,15 +64,46 @@ export class LmStudioProvider implements TextGenerationProvider {
       throw new LmStudioProviderError("LM Studio returned an invalid chat completion response.");
     }
 
-    const content = getAssistantContent(payload);
-    if (content === null || content.length === 0) {
+    const modelResponse = getModelResponse(payload);
+    if (modelResponse === null) {
       throw new LmStudioProviderError("LM Studio returned an invalid chat completion response.");
     }
-    return content;
+    return modelResponse;
   }
 }
 
-function getAssistantContent(payload: unknown): string | null {
+function toLmStudioMessage(message: ModelMessage): Record<string, unknown> {
+  if (message.role === "assistant" && "toolCall" in message) {
+    return {
+      role: "assistant",
+      tool_calls: [{
+        id: message.toolCall.callId,
+        type: "function",
+        function: {
+          name: message.toolCall.name,
+          arguments: JSON.stringify(message.toolCall.arguments),
+        },
+      }],
+    };
+  }
+  if (message.role === "tool") {
+    return { role: "tool", tool_call_id: message.callId, content: message.content };
+  }
+  return { role: message.role, content: message.content };
+}
+
+function toLmStudioTool(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema,
+    },
+  };
+}
+
+function getModelResponse(payload: unknown): ModelResponse | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
   }
@@ -81,6 +119,50 @@ function getAssistantContent(payload: unknown): string | null {
   if (typeof message !== "object" || message === null) {
     return null;
   }
-  const content = (message as Record<string, unknown>).content;
-  return typeof content === "string" ? content : null;
+  const candidate = message as Record<string, unknown>;
+  if ("tool_calls" in candidate && candidate.tool_calls !== undefined) {
+    if (!Array.isArray(candidate.tool_calls) || candidate.tool_calls.length > 1) {
+      return null;
+    }
+    if (candidate.tool_calls.length === 0) {
+      return typeof candidate.content === "string" && candidate.content.length > 0
+        ? { kind: "final", text: candidate.content }
+        : null;
+    }
+    const toolCall = candidate.tool_calls[0];
+    if (typeof toolCall !== "object" || toolCall === null) {
+      return null;
+    }
+    const toolCallRecord = toolCall as Record<string, unknown>;
+    const functionCall = toolCallRecord.function;
+    if (
+      toolCallRecord.type !== "function" ||
+      typeof toolCallRecord.id !== "string" ||
+      toolCallRecord.id.length === 0 ||
+      typeof functionCall !== "object" ||
+      functionCall === null
+    ) {
+      return null;
+    }
+    const functionRecord = functionCall as Record<string, unknown>;
+    if (typeof functionRecord.name !== "string" || functionRecord.name.length === 0 || typeof functionRecord.arguments !== "string") {
+      return null;
+    }
+    let argumentsValue: unknown;
+    try {
+      argumentsValue = JSON.parse(functionRecord.arguments) as unknown;
+    } catch {
+      return null;
+    }
+    return {
+      kind: "tool-call",
+      callId: toolCallRecord.id,
+      name: functionRecord.name,
+      arguments: argumentsValue,
+    };
+  }
+
+  return typeof candidate.content === "string" && candidate.content.length > 0
+    ? { kind: "final", text: candidate.content }
+    : null;
 }

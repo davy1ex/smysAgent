@@ -11,6 +11,7 @@ AI может исследовать варианты, подготовить п
 - [ADR-0001: Headless-first application API и CLI](ADR-0001-headless-first.md) — внутренний application API и минимальный CLI входят в первый исполняемый срез; HTTP и worker отложены до конкретной потребности.
 - [ADR-0002: Один ход через fake provider и store v2](ADR-0002-fake-agent-turn-store-v2.md) — CLI выполняет явный детерминированный ход; JSON-хранилище принимает сообщения пользователя и ассистента и мигрирует v1 при первой записи.
 - [ADR-0003: LM Studio через OpenAI-compatible Chat Completions](ADR-0003-lm-studio-provider.md) — первый реальный provider передаёт полную историю одним non-streaming запросом без изменения application API и формата хранилища.
+- [ADR-0004: Ограниченный agent loop с одним инструментом](ADR-0004-bounded-agent-tool-loop.md) — до двух вызовов модели и одного вызова инструмента за ход; runtime проверяет разрешение, а tool-сообщения не попадают в store v2.
 
 ## Шаблон
 

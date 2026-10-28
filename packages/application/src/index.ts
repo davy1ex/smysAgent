@@ -1,3 +1,16 @@
 export { InvalidArgumentError, SessionNotFoundError } from "./errors";
-export type { AssistantMessageDraft, SessionRepository, UserMessageDraft } from "./ports";
+export { AgentRuntimeError } from "../../core/src/agent-runtime";
+export type { AgentExecutionOptions, AssistantMessageDraft, SessionRepository, UserMessageDraft } from "./ports";
 export { createSession, getHistory, runAgentTurn, sendMessage } from "./use-cases";
+export type {
+  AgentRuntimeErrorCode,
+  AgentTool,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  TextGenerationProvider,
+  ToolCall,
+  ToolDefinition,
+  ToolPermissionPolicy,
+  ToolPermissionRequest,
+} from "../../core/src/agent-runtime";

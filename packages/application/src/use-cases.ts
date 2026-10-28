@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { runAgentTurn as generateAgentReply, type TextGenerationProvider } from "../../core/src/agent-runtime";
 import type { AssistantMessage, Session, SessionHistory, SessionId, UserMessage } from "../../core/src/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
-import type { SessionRepository } from "./ports";
+import type { AgentExecutionOptions, SessionRepository } from "./ports";
 
 export async function createSession(repository: SessionRepository): Promise<Session> {
   const session: Session = {
@@ -39,10 +39,14 @@ export async function runAgentTurn(
   repository: SessionRepository,
   provider: TextGenerationProvider,
   input: { sessionId: SessionId; text: string },
+  agentOptions: AgentExecutionOptions = {},
 ): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }> {
   const userMessage = await sendMessage(repository, input);
   const history = await getHistory(repository, input.sessionId);
-  const text = await generateAgentReply(history.messages, provider);
+  const text = await generateAgentReply(history.messages, provider, {
+    sessionId: input.sessionId,
+    ...agentOptions,
+  });
   const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
     id: randomUUID(),
     createdAt: new Date().toISOString(),

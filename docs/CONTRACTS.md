@@ -1,10 +1,10 @@
 # Contracts
 
-**Статус:** разделы Application API и CLI фиксируют реализованный внутренний контракт и формат JSON-хранилища. Концептуальные сущности, расширенный provider, tools, события и record/replay ниже — черновики будущих сценариев, не реализованные или публичные API. Provider-срез зафиксирован в ADR-0002 и ADR-0003.
+**Статус:** разделы Application API и CLI фиксируют реализованный внутренний контракт и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004. События и record/replay остаются черновиками будущих сценариев.
 
 ## Принципы проектирования
 
-Это ориентиры для внутренних контрактов. Принципы про события и инструменты относятся к будущим черновым сценариям и не означают, что такие механизмы уже реализованы.
+Это ориентиры для внутренних контрактов. Событийный журнал остаётся будущим сценарием; ограниченное выполнение инструмента реализовано и проходит проверку разрешений.
 
 - Внутренние сообщения и события не повторяют формат конкретного API модели.
 - Сохранённые данные имеют версионируемый собственный формат.
@@ -18,9 +18,9 @@ Application API — внутренний интерфейс use cases, чере�
 
 Сейчас эти use cases вызывает CLI; тесты могут вызывать их напрямую с подменёнными портами. Будущий web host должен использовать те же use cases. Если он окажется в отдельном процессе, HTTP adapter может преобразовать запросы в application commands; такого adapter сейчас нет.
 
-CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, один ход через явно выбранный fake или LM Studio provider и чтение истории. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
+CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход через явно выбранный fake или LM Studio provider и чтение истории. CLI выполняет `agent run` без инструментов. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
 
-CLI не реализует agent loop и не исполняет инструменты. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
+CLI не содержит собственной реализации agent loop и вызывает application use case без инструментов. Ограниченный runtime проверяет имя инструмента, аргументы и разрешение до исполнения для application callers, которые передают инструмент и policy. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
 Открытыми остаются форма streaming-событий, протокол HTTP (если понадобится), размещение web/backend по процессам и расширение сохранённой схемы.
 
@@ -31,7 +31,7 @@ CLI не реализует agent loop и не исполняет инструм
 ```ts
 createSession(repository: SessionRepository): Promise<Session>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string }): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }>
+runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string }, options?: AgentExecutionOptions): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }>
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
 
 interface SessionRepository {
@@ -41,12 +41,17 @@ interface SessionRepository {
   getHistory(sessionId: string): Promise<SessionHistory | null>;
 }
 
+interface AgentExecutionOptions {
+  tools?: readonly AgentTool[];
+  permissionPolicy?: ToolPermissionPolicy;
+}
+
 interface TextGenerationProvider {
-  generate(messages: readonly Message[]): Promise<string>;
+  generate(request: ModelRequest): Promise<ModelResponse>;
 }
 ```
 
-`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, делает один вызов provider и сохраняет текстовый ответ ассистента. Если provider завершается ошибкой, пользовательское сообщение остаётся в истории без ответа. В этом срезе инструменты не передаются. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Application callers могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -76,6 +81,8 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 
 `agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках.
 
+Ручной provider smoke test выполняется командой `npm run smoke:lm-studio`; она требует `LM_STUDIO_MODEL`, использует `LM_STUDIO_ENDPOINT` или стандартный endpoint и при наличии передаёт `LM_API_TOKEN`. Команда делает один non-streaming текстовый запрос и возвращает JSON в stdout/stderr. Она не входит в `npm test` и требует запущенный локальный LM Studio server.
+
 Каталог хранилища выбирается по приоритету: `--data-dir`, переменная окружения `SMYS_DATA_DIR`, затем `.smys-agent` в папке запуска CLI. При запуске через npm используется исходная папка вызова npm (`INIT_CWD`). Пути относительно папки запуска разрешаются от неё. Текущий `store.json` содержит `formatVersion: 2`, массивы `sessions` и `messages`; сообщения имеют роль `user` или `assistant`, одну текстовую часть `content`, ISO-время и целый `sequence`, уникальный в пределах сессии. История читается по возрастанию `sequence`. Запись выполняется через временный файл с последующим rename.
 
 Формат v1 принимается для чтения без записи на диск. При первой мутации валидный v1 переносится в v2; исходные bytes сохраняются в `store.json.v1.bak`. Существующий backup допускается только при точном совпадении с исходным файлом. Неизвестная версия и повреждённый документ отклоняются без изменения файла. После миграции старые версии приложения, которые понимают только v1, не могут читать основной файл; для возврата доступна сохранённая копия v1. Одновременные записи нескольких процессов и идемпотентность повторной команды этим срезом не гарантируются.
@@ -104,7 +111,7 @@ type ContentPart =
 type ToolDefinition = {
   name: string;
   description: string;
-  inputSchema: unknown;
+  inputSchema: Record<string, unknown>;
 };
 
 type ToolContext = { sessionId: SessionId; signal?: AbortSignal };
@@ -127,48 +134,47 @@ type AgentEvent = {
 
 До утверждения нужно определить допустимые части мультимодального контента, сериализацию `unknown`, поведение при несовместимой версии и набор событий. Секреты провайдера не являются частью Message или AgentEvent.
 
-## Provider: реализованный порт и черновик расширения
+## Provider: реализованный порт
 
-Текущий порт — `TextGenerationProvider.generate(messages): Promise<string>` для одного синхронного текстового ответа. Fake provider возвращает детерминированный ответ и не обращается к сети. LM Studio отправляет всю упорядоченную текстовую историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false`, без инструментов. Ошибки соединения, HTTP, формата ответа и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Конкретные параметры CLI и обработка ошибок описаны выше.
-
-Расширенная форма ниже — концептуальный вариант; она не является текущим типом или утверждённым публичным интерфейсом.
+Provider принимает внутренний `ModelRequest` и возвращает `ModelResponse`. Обычный текст возвращается как `{ kind: "final", text }`; вызов инструмента — как `{ kind: "tool-call", callId, name, arguments }`. Контекст может содержать обычные user/assistant сообщения, временное сообщение assistant с tool call и временный tool result. Эти типы не зависят от wire-формата провайдера.
 
 ```ts
-interface ModelProvider {
-  generate(input: ModelRequest, options?: { signal?: AbortSignal }): Promise<ModelResponse>;
+type ModelMessage =
+  | { role: "user" | "assistant"; content: string }
+  | { role: "assistant"; toolCall: { callId: string; name: string; arguments: unknown } }
+  | { role: "tool"; callId: string; name: string; content: string };
+
+interface ModelRequest {
+  messages: readonly ModelMessage[];
+  tools: readonly ToolDefinition[];
 }
 
-type ModelRequest = {
-  model: string;
-  messages: Message[];
-  tools: ToolDefinition[];
-};
-
-type ModelResponse = {
-  message?: Message;
-  finishReason: "stop" | "tool-calls" | "length" | "error";
-  usage?: { inputTokens?: number; outputTokens?: number };
-};
+type ModelResponse =
+  | { kind: "final"; text: string }
+  | { kind: "tool-call"; callId: string; name: string; arguments: unknown };
 ```
 
-Адаптер отвечает за преобразование запроса, вызов конкретного API, разбор ответа и нормализацию ошибок. Streaming, capability discovery, модельные настройки, лимиты и строгая обработка некорректных tool call нуждаются в уточнении перед фиксацией публичного интерфейса.
+Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false`. Если переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Ошибки соединения, HTTP, формата ответа и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Streaming, capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
 
-## Черновик: инструменты и разрешения
-
-Этот порт не реализован. Если agent loop будет исполнять инструмент, разрешение должно проверяться до побочного эффекта.
+## Ограниченный контракт инструментов и разрешений
 
 ```ts
-interface Tool {
+interface AgentTool {
   definition: ToolDefinition;
-  execute(input: unknown, context: ToolContext): Promise<ToolResult>;
+  validateInput(input: unknown): boolean;
+  execute(input: unknown, context: { sessionId: SessionId }): Promise<string>;
 }
 
-interface PermissionPolicy {
-  authorize(request: ToolPermissionRequest): Promise<"allow" | "deny" | "ask-user">;
+interface ToolPermissionPolicy {
+  authorize(request: ToolPermissionRequest): Promise<"allow" | "deny">;
 }
 ```
 
-Executor проверяет разрешение до передачи управления `execute`. Отказ, запрос подтверждения и результат инструмента становятся наблюдаемыми событиями. Runtime не исполняет tool call напрямую и не должен обходить permission policy.
+В одном ходе можно передать максимум один инструмент. `inputSchema` описывает аргументы provider, а локальный `validateInput` проверяет их перед выполнением; общий JSON Schema engine не добавлен, поэтому реализация инструмента должна поддерживать соответствие этих двух описаний. Runtime проверяет имя и `validateInput`, затем вызывает policy и выполняет инструмент только при ответе `allow`; отсутствие policy делает конфигурацию с инструментом недействительной. `ask-user` не поддерживается, поскольку application API пока не имеет host для подтверждения. Лимит — два вызова модели и один вызов инструмента за ход; повторный tool call отклоняется до выполнения. Ошибки имени, аргументов, разрешения, инструмента и лимита завершают ход без финального ответа.
+
+Вызовы и результаты инструментов добавляются только во временный контекст provider. Формат store v2 не изменён: сохраняются пользовательское сообщение и финальный текст ассистента. При ошибке после записи пользователя ответ ассистента не добавляется.
+
+Runtime ограничивает ход двумя запросами модели и одним вызовом инструмента. Итерация — один запрос provider и один ответ; само выполнение инструмента отдельной итерацией не считается. Инструменты передаются вызывающим application code; динамической загрузки, discovery, повторов и обработки `ask-user` нет. Ошибки runtime типизированы (`INVALID_CONFIGURATION`, `INVALID_MODEL_RESPONSE`, `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `PERMISSION_DENIED`, `PERMISSION_CHECK_FAILED`, `TOOL_EXECUTION_FAILED`, `LOOP_LIMIT`); CLI показывает их через существующий `INTERNAL_ERROR` и код выхода `1`.
 
 ## Черновик: будущие порты хранения и событий
 
