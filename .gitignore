@@ -2,6 +2,6 @@ node_modules/
 dist/
 .smys-agent/
 /data/
-sandbox/store.json
+sandbox
 .DS_Store
 templates

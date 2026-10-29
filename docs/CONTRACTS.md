@@ -189,6 +189,8 @@ interface ToolPermissionPolicy {
 
 Runtime ограничивает ход двумя запросами модели и одним вызовом инструмента. Итерация — один запрос provider и один ответ; само выполнение инструмента отдельной итерацией не считается. Инструменты передаются вызывающим application code; динамической загрузки, discovery, повторов и обработки `ask-user` нет. Ошибки runtime типизированы (`INVALID_CONFIGURATION`, `INVALID_MODEL_RESPONSE`, `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `PERMISSION_DENIED`, `PERMISSION_CHECK_FAILED`, `TOOL_EXECUTION_FAILED`, `LOOP_LIMIT`); CLI показывает их через существующий `INTERNAL_ERROR` и код выхода `1`.
 
+При исключении из `AgentTool.execute()` ошибка `TOOL_EXECUTION_FAILED` сохраняет исходное значение в стандартном поле `cause`. Безопасные `code` и `message` остаются прежними; CLI не включает `cause` в текстовый или JSON-ответ.
+
 ## Черновик: будущие порты хранения и событий
 
 Возможные будущие обязанности:

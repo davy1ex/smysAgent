@@ -7,12 +7,14 @@
 В репозитории реализован headless-путь: CLI вызывает application use cases, application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет прочитать историю следующим процессом. Core/application реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
 
 ```text
-apps/cli/src/main.ts
-packages/application/src/{errors,index,ports,use-cases}.ts
-packages/core/src/{agent-runtime,session}.ts
-packages/providers/src/{fake-provider,lm-studio-provider}.ts
-packages/storage/src/{errors,index,json-file-session-repository,store-format}.ts
-tests/{application,cli,providers,storage}/
+src/apps/cli/{demo-tools,main,smoke-lm-studio}.ts
+src/packages/application/{errors,index,ports,use-cases}.ts
+src/packages/core/agent/{errors,index,model,runtime,tool}.ts
+src/packages/core/session.ts
+src/packages/providers/{fake-provider,lm-studio-provider}.ts
+src/packages/storage/{errors,index,json-file-session-repository,store-format}.ts
+src/tests/{application,cli,providers,storage}/
+docs/
 ```
 
 В текущем срезе нет UI, сущности проекта, событийного журнала, record/replay, фонового worker или функций поиска по знаниям. Реальный provider — LM Studio; fake provider нужен для детерминированного текстового хода и проверки ограниченного вызова тестового инструмента. Детали реализованных API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
@@ -41,28 +43,25 @@ flowchart TB
 
 Диаграмма описывает целевые роли, а не текущий поток кода. Провайдеры и названия вендоров — примеры направлений адаптеров, не выбор поставщика или библиотеки. CLI — единственный реализованный host. Web/Desktop UI и worker остаются будущими сценариями; размещение UI по процессам и способ упаковки не выбраны.
 
-## Целевые области и возможное размещение
+## Структура модулей и возможное расширение
 
 ```text
 .
-├── apps/
-│   ├── cli/
-│   │   └── src/main.ts                  # реализовано
-│   ├── web/                             # не реализовано
-│   └── worker/                          # отложен до сценария фоновых задач
-├── packages/
-│   ├── application/
-│   │   └── src/                         # реализовано
-│   ├── core/
-│   │   └── src/                         # agent-runtime.ts и session.ts реализованы
-│   ├── providers/
-│   │   └── src/                         # fake-provider.ts и lm-studio-provider.ts реализованы
-│   ├── storage/
-│   │   └── src/                         # JSON-файловый адаптер реализован
-└── tests/                               # application, CLI, providers, storage
+├── src/
+│   ├── apps/
+│   │   ├── cli/                          # реализованный host
+│   │   └── desktop/                      # будущий host
+│   ├── packages/
+│   │   ├── application/                  # use cases и порты
+│   │   ├── core/                         # runtime и сущности сессии
+│   │   ├── providers/                    # fake и LM Studio adapters
+│   │   └── storage/                      # JSON-файловый adapter
+│   ├── plugins/                          # будущие интеграции
+│   └── tests/                            # application, CLI, providers, storage
+└── docs/
 ```
 
-Это ориентир каталогов, а не план немедленного создания всех перечисленных каталогов. Tool-calling и YouTube-функция пока не закреплены за отдельным пакетом или plugin-системой. Новые границы и пути следует выбирать вместе с конкретным сквозным сценарием. Текущее хранилище — версионируемый JSON-файл; SQLite не выбран.
+Каталоги `src/apps/desktop/` и `src/plugins/` показаны как возможные будущие направления и пока не созданы. `src/packages/application/` сохранён как отдельная граница use cases. Tool-calling пока не выделен в отдельный пакет; YouTube-плагин не реализован. Текущее хранилище — версионируемый JSON-файл; SQLite не выбран.
 
 ## Целевые ответственности модулей
 
@@ -70,9 +69,9 @@ flowchart TB
 
 | Модуль | Отвечает за | Не должен знать |
 | --- | --- | --- |
-| UI (`apps/web`, desktop host) | Отображение состояния; пользовательский ввод; отправку команд | Внутренности цикла агента, SQL и формат API конкретной модели |
-| CLI (`apps/cli`) | Headless-команды, скриптовое управление, структурированный вывод и коды завершения | Собственную реализацию agent loop, прямое управление БД и обход проверок разрешений |
-| Application API / application layer | Создание проектов и сессий; команды чата и задач; связывание входов с runtime и портами | UI-компоненты, транспорт HTTP и детали сетевого протокола провайдера |
+| UI (`src/apps/desktop`) | Отображение состояния; пользовательский ввод; отправку команд | Внутренности цикла агента, SQL и формат API конкретной модели |
+| CLI (`src/apps/cli`) | Headless-команды, скриптовое управление, структурированный вывод и коды завершения | Собственную реализацию agent loop, прямое управление БД и обход проверок разрешений |
+| Application API (`src/packages/application`) | Создание проектов и сессий; команды чата и задач; связывание входов с runtime и портами | UI-компоненты, транспорт HTTP и детали сетевого протокола провайдера |
 | Core / Agent Runtime | Ход сессии, сбор контекста, ответы модели, вызовы инструментов, события и отмена | React, SQLite, OpenRouter, YouTube и другие конкретные адаптеры |
 | Providers | Преобразование внутреннего запроса в формат модели и нормализация ответа обратно | UI, хранение чатов и бизнес-логика приложения |
 | Tools | Регистрация и выполнение инструментов; проверка разрешений до побочного эффекта | Представление UI и внутренний формат API модели |
@@ -92,7 +91,7 @@ flowchart TB
 
 ## Application API и входы: текущее и будущее
 
-Текущий `packages/application` предоставляет `createSession`, `sendMessage`, `runAgentTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `createProject` и `replaySession` не реализованы.
+Текущий `src/packages/application` предоставляет `createSession`, `sendMessage`, `runAgentTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `createProject` и `replaySession` не реализованы.
 
 - CLI — ранний headless host и единственный пользовательский вход первого сквозного среза. Команды позволяют создать сессию, сохранить сообщение без модели, выполнить один ход с явным `--provider fake` или `--provider lm-studio` и прочитать историю. Он вызывает application API, поддерживает JSON-вывод и стабильные коды завершения.
 - Будущий web host должен вызывать те же use cases; если он окажется в отдельном процессе, способ связи потребуется отдельно решить.

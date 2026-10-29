@@ -9,12 +9,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint apps packages tests",
-    "test": "npm run build && node --test dist/tests/application/*.test.js dist/tests/storage/*.test.js dist/tests/providers/*.test.js dist/tests/cli/*.test.js",
+    "lint": "eslint src",
+    "test": "npm run build && node --test dist/src/tests/application/*.test.js dist/src/tests/storage/*.test.js dist/src/tests/providers/*.test.js dist/src/tests/cli/*.test.js",
     "precli": "npm run build",
-    "cli": "node dist/apps/cli/src/main.js",
+    "cli": "node dist/src/apps/cli/main.js",
     "presmoke:lm-studio": "npm run build",
-    "smoke:lm-studio": "node dist/apps/cli/src/smoke-lm-studio.js"
+    "smoke:lm-studio": "node dist/src/apps/cli/smoke-lm-studio.js"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

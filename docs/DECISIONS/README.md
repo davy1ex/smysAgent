@@ -13,6 +13,7 @@ AI может исследовать варианты, подготовить п
 - [ADR-0003: LM Studio через OpenAI-compatible Chat Completions](ADR-0003-lm-studio-provider.md) — первый реальный provider передаёт полную историю одним non-streaming запросом без изменения application API и формата хранилища.
 - [ADR-0004: Ограниченный agent loop с одним инструментом](ADR-0004-bounded-agent-tool-loop.md) — до двух вызовов модели и одного вызова инструмента за ход; runtime проверяет разрешение, а tool-сообщения не попадают в store v2.
 - [ADR-0005: Явный CLI smoke-инструмент `demo.add`](ADR-0005-cli-demo-add.md) — CLI по умолчанию без tools; подключение `demo.add` и разрешение её исполнения требуют отдельных флагов.
+- [ADR-0006: Причина ошибки исполнения инструмента](ADR-0006-tool-error-cause.md) — runtime сохраняет исходную причину в `cause`, оставляя CLI безопасное сообщение ошибки.
 
 ## Шаблон
 
