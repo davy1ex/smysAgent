@@ -23,8 +23,13 @@ export interface ModelRequest {
 }
 
 export type ModelResponse =
-  | { kind: "final"; text: string }
-  | { kind: "tool-call"; callId: string; name: string; arguments: unknown };
+  | { kind: "final"; text: string; reasoning?: string }
+  | { kind: "tool-call"; callId: string; name: string; arguments: unknown; reasoning?: string };
+
+export interface AgentTurnResult {
+  text: string;
+  reasoning?: string;
+}
 
 export interface TextGenerationProvider {
   generate(request: ModelRequest): Promise<ModelResponse>;
@@ -76,7 +81,7 @@ export async function runAgentTurn(
   messages: readonly Message[],
   provider: TextGenerationProvider,
   options: AgentRuntimeOptions,
-): Promise<string> {
+): Promise<AgentTurnResult> {
   const tools = options.tools ?? [];
   if (tools.length > MAX_TOOL_CALLS) {
     throw new AgentRuntimeError("INVALID_CONFIGURATION", "An agent turn can expose at most one tool.");
@@ -97,6 +102,7 @@ export async function runAgentTurn(
     content: message.content[0].text,
   }));
   let toolCalls = 0;
+  const reasoningParts: string[] = [];
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
     const response = await provider.generate({
@@ -107,11 +113,22 @@ export async function runAgentTurn(
     if (typeof response !== "object" || response === null) {
       throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");
     }
+    if (response.reasoning !== undefined) {
+      if (typeof response.reasoning !== "string") {
+        throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned invalid reasoning.");
+      }
+      if (response.reasoning.length > 0) {
+        reasoningParts.push(response.reasoning);
+      }
+    }
     if (response.kind === "final") {
       if (typeof response.text !== "string" || response.text.length === 0) {
         throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an empty response.");
       }
-      return response.text;
+      return {
+        text: response.text,
+        ...(reasoningParts.length > 0 ? { reasoning: reasoningParts.join("\n\n") } : {}),
+      };
     }
     if (response.kind !== "tool-call") {
       throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");

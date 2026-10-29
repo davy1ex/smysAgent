@@ -30,7 +30,7 @@ test("demo.add returns its sum to the model before the final response", async ()
     permissionPolicy: { async authorize() { return "allow"; } },
   });
 
-  assert.equal(response, "The sum is 5.");
+  assert.deepEqual(response, { text: "The sum is 5." });
   assert.equal(provider.requests.length, 2);
   assert.deepEqual(provider.requests[1]?.messages.at(-1), {
     role: "tool",

@@ -248,7 +248,13 @@ test("LM Studio CLI turns persist and a separate history process reads them", as
   const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-lm-studio-"));
   t.after(async () => rm(dataDir, { recursive: true, force: true }));
   const stub = await startLmStudioStub(200, {
-    choices: [{ message: { role: "assistant", content: "stubbed model reply" } }],
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "stubbed model reply",
+        reasoning_content: "stubbed model reasoning",
+      },
+    }],
   });
   t.after(stub.close);
 
@@ -264,12 +270,19 @@ test("LM Studio CLI turns persist and a separate history process reads them", as
     LM_API_TOKEN: "mock-token",
   });
   assert.equal(firstRun.status, 0, firstRun.stderr);
+  const firstResult = JSON.parse(firstRun.stdout) as {
+    reasoning: string;
+    assistantMessage: { content: Array<{ text: string }> };
+  };
+  assert.equal(firstResult.reasoning, "stubbed model reasoning");
+  assert.deepEqual(firstResult.assistantMessage.content, [{ type: "text", text: "stubbed model reply" }]);
 
   const secondRun = await runCliAsync(dataDir, [
-    "agent", "run", "--json", "--provider", "lm-studio", "--model", "publisher/model-id",
+    "agent", "run", "--provider", "lm-studio", "--model", "publisher/model-id",
     "--session-id", created.session.id, "--text", "second LM Studio request",
   ], { LM_STUDIO_ENDPOINT: stub.endpoint });
   assert.equal(secondRun.status, 0, secondRun.stderr);
+  assert.match(secondRun.stdout, /Reasoning:\nstubbed model reasoning\n\nstubbed model reply/);
 
   assert.deepEqual(stub.requests.map(({ method, path, body }) => ({ method, path, body })), [
     {

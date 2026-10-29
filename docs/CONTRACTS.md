@@ -31,7 +31,7 @@ CLI не содержит собственной реализации agent loop
 ```ts
 createSession(repository: SessionRepository): Promise<Session>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string }, options?: AgentExecutionOptions): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }>
+runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string }, options?: AgentExecutionOptions): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
 
 interface SessionRepository {
@@ -51,7 +51,7 @@ interface TextGenerationProvider {
 }
 ```
 
-`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -77,7 +77,15 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 {"ok":true,"userMessage":{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."},"assistantMessage":{"id":"...","sessionId":"...","sequence":2,"role":"assistant","content":[{"type":"text","text":"Fake response to: ..."}],"createdAt":"..."}}
 ```
 
+Для provider, вернувшего reasoning, `agent run` добавляет его отдельным верхнеуровневым полем:
+
+```json
+{"ok":true,"userMessage":{"id":"..."},"assistantMessage":{"id":"...","role":"assistant","content":[{"type":"text","text":"..."}]},"reasoning":"..."}
+```
+
 Каждый ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища. Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. Без `--json` используются краткие текстовые сообщения.
+
+Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; текстовый вывод печатает его под заголовком `Reasoning:` перед финальным ответом. Это поле относится к текущему выполнению и не добавляется в сохранённый `assistantMessage` или историю.
 
 `agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
 
@@ -136,7 +144,7 @@ type AgentEvent = {
 
 ## Provider: реализованный порт
 
-Provider принимает внутренний `ModelRequest` и возвращает `ModelResponse`. Обычный текст возвращается как `{ kind: "final", text }`; вызов инструмента — как `{ kind: "tool-call", callId, name, arguments }`. Контекст может содержать обычные user/assistant сообщения, временное сообщение assistant с tool call и временный tool result. Эти типы не зависят от wire-формата провайдера.
+Provider принимает внутренний `ModelRequest` и возвращает `ModelResponse`. Обычный текст возвращается как `{ kind: "final", text, reasoning? }`; вызов инструмента — как `{ kind: "tool-call", callId, name, arguments, reasoning? }`. `reasoning` — необязательный внутренний текстовый фрагмент, нормализованный provider из доступного поля ответа модели. Контекст может содержать обычные user/assistant сообщения, временное сообщение assistant с tool call и временный tool result. Эти типы не зависят от wire-формата провайдера.
 
 ```ts
 type ModelMessage =
@@ -150,11 +158,16 @@ interface ModelRequest {
 }
 
 type ModelResponse =
-  | { kind: "final"; text: string }
-  | { kind: "tool-call"; callId: string; name: string; arguments: unknown };
+  | { kind: "final"; text: string; reasoning?: string }
+  | { kind: "tool-call"; callId: string; name: string; arguments: unknown; reasoning?: string };
+
+interface AgentTurnResult {
+  text: string;
+  reasoning?: string;
+}
 ```
 
-Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false`. Если переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Ошибки соединения, HTTP, формата ответа и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Streaming, capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
+Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false` и читает reasoning из `reasoning_content`. Если переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Runtime возвращает reasoning всех вызовов модели за ход в порядке получения, разделяя части пустой строкой. Ошибки соединения, HTTP, формата ответа и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Streaming, capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
 
 ## Ограниченный контракт инструментов и разрешений
 

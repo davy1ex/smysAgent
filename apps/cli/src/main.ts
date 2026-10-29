@@ -316,8 +316,15 @@ function writeSuccess(value: Record<string, unknown>, json: boolean): void {
     return;
   }
   if ("assistantMessage" in value && typeof value.assistantMessage === "object" && value.assistantMessage !== null) {
-    const turn = value as { userMessage: { id: string }; assistantMessage: { content: Array<{ text: string }> } };
+    const turn = value as {
+      userMessage: { id: string };
+      assistantMessage: { content: Array<{ text: string }> };
+      reasoning?: string;
+    };
     process.stdout.write(`Saved user message ${turn.userMessage.id}\n`);
+    if (typeof turn.reasoning === "string" && turn.reasoning.length > 0) {
+      process.stdout.write(`Reasoning:\n${turn.reasoning}\n\n`);
+    }
     process.stdout.write(`${turn.assistantMessage.content.map((part) => part.text).join("\n")}\n`);
     return;
   }

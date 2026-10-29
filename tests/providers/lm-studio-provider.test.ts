@@ -72,6 +72,28 @@ test("LM Studio provider omits authorization when no token is configured", async
   assert.equal(requestHeaders?.has("authorization"), false);
 });
 
+test("LM Studio provider returns reasoning separately from the final text", async () => {
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async () => jsonResponse({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "final answer",
+          reasoning_content: "reasoning text",
+        },
+      }],
+    }),
+  });
+
+  assert.deepEqual(await provider.generate(request), {
+    kind: "final",
+    text: "final answer",
+    reasoning: "reasoning text",
+  });
+});
+
 test("LM Studio provider normalizes a connection failure", async () => {
   const fetcher: typeof fetch = async () => {
     throw new Error("sensitive low-level transport details");
@@ -134,6 +156,7 @@ test("LM Studio provider sends one tool definition and parses one function call"
         message: {
           role: "assistant",
           content: null,
+          reasoning_content: "Preparing the tool call.",
           tool_calls: [{
             id: "call-1",
             type: "function",
@@ -155,6 +178,7 @@ test("LM Studio provider sends one tool definition and parses one function call"
     callId: "call-1",
     name: "test.echo",
     arguments: { text: "hello" },
+    reasoning: "Preparing the tool call.",
   });
   assert.deepEqual(requestBody?.tools, [{
     type: "function",

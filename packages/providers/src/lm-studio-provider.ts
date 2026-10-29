@@ -120,13 +120,16 @@ function getModelResponse(payload: unknown): ModelResponse | null {
     return null;
   }
   const candidate = message as Record<string, unknown>;
+  const reasoning = typeof candidate.reasoning_content === "string" && candidate.reasoning_content.length > 0
+    ? candidate.reasoning_content
+    : undefined;
   if ("tool_calls" in candidate && candidate.tool_calls !== undefined) {
     if (!Array.isArray(candidate.tool_calls) || candidate.tool_calls.length > 1) {
       return null;
     }
     if (candidate.tool_calls.length === 0) {
       return typeof candidate.content === "string" && candidate.content.length > 0
-        ? { kind: "final", text: candidate.content }
+        ? { kind: "final", text: candidate.content, ...(reasoning === undefined ? {} : { reasoning }) }
         : null;
     }
     const toolCall = candidate.tool_calls[0];
@@ -159,10 +162,11 @@ function getModelResponse(payload: unknown): ModelResponse | null {
       callId: toolCallRecord.id,
       name: functionRecord.name,
       arguments: argumentsValue,
+      ...(reasoning === undefined ? {} : { reasoning }),
     };
   }
 
   return typeof candidate.content === "string" && candidate.content.length > 0
-    ? { kind: "final", text: candidate.content }
+    ? { kind: "final", text: candidate.content, ...(reasoning === undefined ? {} : { reasoning }) }
     : null;
 }

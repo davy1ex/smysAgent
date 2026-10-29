@@ -40,22 +40,26 @@ export async function runAgentTurn(
   provider: TextGenerationProvider,
   input: { sessionId: SessionId; text: string },
   agentOptions: AgentExecutionOptions = {},
-): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage }> {
+): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> {
   const userMessage = await sendMessage(repository, input);
   const history = await getHistory(repository, input.sessionId);
-  const text = await generateAgentReply(history.messages, provider, {
+  const result = await generateAgentReply(history.messages, provider, {
     sessionId: input.sessionId,
     ...agentOptions,
   });
   const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
-    text,
+    text: result.text,
   });
   if (assistantMessage === null) {
     throw new SessionNotFoundError(input.sessionId);
   }
-  return { userMessage, assistantMessage };
+  return {
+    userMessage,
+    assistantMessage,
+    ...(result.reasoning === undefined ? {} : { reasoning: result.reasoning }),
+  };
 }
 
 export async function getHistory(

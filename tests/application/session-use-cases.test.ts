@@ -96,7 +96,7 @@ test("application API runs one provider turn and persists ordered user and assis
         providerCalls += 1;
         assert.equal(messages.messages.length, 1);
         assert.equal(messages.messages[0]?.role, "user");
-        return { kind: "final", text: "deterministic reply" };
+        return { kind: "final", text: "deterministic reply", reasoning: "deterministic reasoning" };
       },
     },
     { sessionId: session.id, text: "hello" },
@@ -107,6 +107,7 @@ test("application API runs one provider turn and persists ordered user and assis
   assert.equal(turn.userMessage.sequence, 1);
   assert.equal(turn.assistantMessage.role, "assistant");
   assert.equal(turn.assistantMessage.sequence, 2);
+  assert.equal(turn.reasoning, "deterministic reasoning");
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0].text]), [
     ["user", "hello"],
     ["assistant", "deterministic reply"],
@@ -119,8 +120,14 @@ test("application API executes one permitted tool and persists only the final an
   const tool = createTestTool();
   let executions = 0;
   const provider = new FakeProvider([
-    { kind: "tool-call", callId: "call-1", name: "test.echo", arguments: { text: "from tool" } },
-    { kind: "final", text: "The tool returned: from tool" },
+    {
+      kind: "tool-call",
+      callId: "call-1",
+      name: "test.echo",
+      arguments: { text: "from tool" },
+      reasoning: "Call the echo tool.",
+    },
+    { kind: "final", text: "The tool returned: from tool", reasoning: "Use the tool result." },
   ]);
   const permissionPolicy: ToolPermissionPolicy = {
     async authorize(request) {
@@ -159,6 +166,7 @@ test("application API executes one permitted tool and persists only the final an
     { role: "tool", callId: "call-1", name: "test.echo", content: "from tool" },
   ]);
   assert.equal(turn.assistantMessage.content[0].text, "The tool returned: from tool");
+  assert.equal(turn.reasoning, "Call the echo tool.\n\nUse the tool result.");
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0].text]), [
     ["user", "use the test tool"],
     ["assistant", "The tool returned: from tool"],
