@@ -45,6 +45,12 @@ export class JsonFileSessionRepository implements SessionRepository {
     await this.writeStore(loaded.store, loaded);
   }
 
+  async listSessionHistories(): Promise<SessionHistory[]> {
+    this.ensureOpen();
+    const loaded = await this.readStore();
+    return loaded.store.sessions.map((session) => toHistory(session, loaded.store.messages));
+  }
+
   async appendUserMessage(sessionId: SessionId, draft: UserMessageDraft): Promise<UserMessage | null> {
     return (await this.appendMessage(sessionId, draft, "user")) as UserMessage | null;
   }

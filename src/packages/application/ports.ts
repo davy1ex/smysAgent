@@ -20,6 +20,7 @@ export interface AssistantMessageDraft {
 
 export interface SessionRepository {
   createSession(session: Session): Promise<void>;
+  listSessionHistories(): Promise<SessionHistory[]>;
   appendUserMessage(sessionId: SessionId, draft: UserMessageDraft): Promise<UserMessage | null>;
   appendAssistantMessage(sessionId: SessionId, draft: AssistantMessageDraft): Promise<AssistantMessage | null>;
   getHistory(sessionId: SessionId): Promise<SessionHistory | null>;

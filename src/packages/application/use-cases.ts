@@ -13,6 +13,30 @@ export async function createSession(repository: SessionRepository): Promise<Sess
   return session;
 }
 
+export interface SessionSummary {
+  id: SessionId;
+  createdAt: string;
+  updatedAt: string;
+  title: string;
+}
+
+export async function listSessions(repository: SessionRepository): Promise<SessionSummary[]> {
+  const histories = await repository.listSessionHistories();
+  return histories
+    .map(({ session, messages }): SessionSummary => {
+      const firstUserMessage = messages.find((message) => message.role === "user");
+      const title = firstUserMessage?.content[0]?.text.trim() || "Новый чат";
+      const lastMessage = messages.at(-1);
+      return {
+        id: session.id,
+        createdAt: session.createdAt,
+        updatedAt: lastMessage?.createdAt ?? session.createdAt,
+        title,
+      };
+    })
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
 export async function sendMessage(
   repository: SessionRepository,
   input: { sessionId: SessionId; text: string },
@@ -38,10 +62,14 @@ export async function sendMessage(
 export async function runAgentTurn(
   repository: SessionRepository,
   provider: TextGenerationProvider,
-  input: { sessionId: SessionId; text: string },
+  input: { sessionId: SessionId; text: string; runId?: string },
   agentOptions: AgentExecutionOptions = {},
-): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> {
-  const userMessage = await sendMessage(repository, input);
+): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> {
+  const runId = input.runId ?? randomUUID();
+  if (runId.length === 0) {
+    throw new InvalidArgumentError("runId must not be empty.");
+  }
+  const userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
   const history = await getHistory(repository, input.sessionId);
   const result = await generateAgentReply(history.messages, provider, {
     sessionId: input.sessionId,
@@ -56,6 +84,7 @@ export async function runAgentTurn(
     throw new SessionNotFoundError(input.sessionId);
   }
   return {
+    runId,
     userMessage,
     assistantMessage,
     ...(result.reasoning === undefined ? {} : { reasoning: result.reasoning }),

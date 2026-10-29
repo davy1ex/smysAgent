@@ -4,25 +4,26 @@
 
 ## Текущая реализация
 
-В репозитории реализован headless-путь: CLI вызывает application use cases, application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет прочитать историю следующим процессом. Core/application реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
+В репозитории реализованы два host: CLI напрямую вызывает application use cases, а браузерный Web-клиент обращается к тем же use cases через локальный HTTP host. Application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет восстановить историю после перезапуска. Core/application реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
 
 ```text
 src/apps/cli/{demo-tools,main,smoke-lm-studio}.ts
-src/apps/web/                         # статический React preview, данные из локальных фикстур
+src/apps/web-host/{main,server}.ts    # локальный HTTP host поверх Application API
+src/apps/web/                         # React/Vite клиент с HTTP adapter
 src/packages/application/{errors,index,ports,use-cases}.ts
 src/packages/core/agent/{errors,index,model,runtime,tool}.ts
 src/packages/core/session.ts
 src/packages/providers/{fake-provider,lm-studio-provider}.ts
 src/packages/storage/{errors,index,json-file-session-repository,store-format}.ts
-src/tests/{application,cli,providers,storage}/
+src/tests/{application,cli,providers,storage,web-host}/
 docs/
 ```
 
-В текущем срезе есть статический React-макет чата в `src/apps/web` с фиктивными проектами и сессиями, вкладками «Чат» и «Траектория» и компактным потоком действий. «Чат» показывает сообщения и краткие строки reasoning/tool calls; «Траектория» раскрывает подробности каждого шага. Статусы относятся к вызовам инструментов, а не к сессиям. Макет не подключён к Application API или backend и остаётся помечен как `DEMO`; локальные состояния навигации и шагов принадлежат только UI. Это preview интерфейса, а не web-host приложения. Остальные UI-host сценарии, сущность проекта, событийный журнал, record/replay, фоновый worker и функции поиска по знаниям не реализованы. Реальный provider — LM Studio; fake provider нужен для детерминированного текстового хода и проверки ограниченного вызова тестового инструмента. Детали реализованных API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
+`src/apps/web` показывает реальные сессии и сообщения из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает Application use cases и выбирает Fake или LM Studio. Проекты и runtime events пока не реализованы: группа сессий называется «Без проекта», а вкладка истории показывает только сохранённые сообщения. Pending/error относятся к текущему пользовательскому ходу в UI; reasoning и tool calls не выдаются за сохранённую trajectory. Web host сериализует изменяющие HTTP-запросы в одном процессе; CLI не должен одновременно записывать тот же JSON store. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
 
 ## Целевая модель
 
-Один модульный монолит с единым application layer и строгими границами ответственности. Не микросервисы и не набор абстрактных слоёв. Каждый host вызывает application API в своём процессе; отдельный HTTP-сервер для этого не нужен. UI и CLI принимают команды, agent runtime управляет ходом агента, а адаптеры связывают его с моделями, инструментами, хранилищем и знаниями.
+Один модульный монолит с единым application layer и строгими границами ответственности. Не микросервисы и не набор абстрактных слоёв. CLI вызывает Application in-process; браузер использует небольшой HTTP transport host из-за границы браузер/Node. UI и CLI принимают команды, agent runtime управляет ходом агента, а адаптеры связывают его с моделями, инструментами, хранилищем и знаниями.
 
 ```mermaid
 flowchart TB
@@ -33,7 +34,8 @@ flowchart TB
     CORE["Agent Runtime<br/>Цикл агента, контекст, события, отмена"]
     APP --> CORE
   end
-  UI --> APP
+  WEBHOST["Local HTTP host<br/>Loopback API"]
+  UI --> WEBHOST --> APP
   CLI["CLI host · ранний вход<br/>Команды, JSON, отладка"] --> APP
   WORKER["Worker host · позже<br/>Расписания и фоновые запуски"] --> APP
   CORE --> PROVIDERS["Model Providers<br/>OpenAI-compatible, Ollama, LM Studio, OpenRouter"]
@@ -42,7 +44,7 @@ flowchart TB
   CORE --> KNOWLEDGE["Knowledge<br/>YouTube, транскрипты, поиск, цитаты"]
 ```
 
-Диаграмма описывает целевые роли, а не текущий поток кода. Провайдеры и названия вендоров — примеры направлений адаптеров, не выбор поставщика или библиотеки. CLI — единственный подключённый host; `src/apps/web` пока только статический preview. Web/Desktop UI-host и worker остаются будущими сценариями; размещение UI по процессам и способ упаковки не выбраны.
+Диаграмма объединяет реализованные и целевые роли. Web HTTP host и CLI подключены; названия provider кроме Fake/LM Studio остаются примерами, а не выбранными интеграциями. Worker и Desktop host остаются будущими сценариями.
 
 ## Структура модулей и возможное расширение
 
@@ -51,6 +53,7 @@ flowchart TB
 ├── src/
 │   ├── apps/
 │   │   ├── cli/                          # реализованный host
+│   │   ├── web-host/                     # реализованный loopback HTTP host
 │   │   └── desktop/                      # будущий host
 │   ├── packages/
 │   │   ├── application/                  # use cases и порты
@@ -66,12 +69,13 @@ flowchart TB
 
 ## Целевые ответственности модулей
 
-Таблица описывает желаемые границы по мере появления сценариев. Сейчас реализованы только CLI, application, core, providers и storage из текущей структуры выше.
+Таблица описывает границы реализованных и будущих модулей.
 
 | Модуль | Отвечает за | Не должен знать |
 | --- | --- | --- |
 | UI (`src/apps/desktop`) | Отображение состояния; пользовательский ввод; отправку команд | Внутренности цикла агента, SQL и формат API конкретной модели |
-| Web preview (`src/apps/web`) | Представление фиктивных проектов, сессий и agent timeline | Application API, Core, backend и реальные данные сессий |
+| Web UI (`src/apps/web`) | Отображение реальных сессий и сообщений; пользовательский ввод; HTTP-запросы | Application/Core imports, provider config, JSON storage и выдуманные runtime events |
+| Web host (`src/apps/web-host`) | HTTP transport, provider/data-dir config, сериализация изменяющих запросов | Собственный agent loop и UI-компоненты |
 | CLI (`src/apps/cli`) | Headless-команды, скриптовое управление, структурированный вывод и коды завершения | Собственную реализацию agent loop, прямое управление БД и обход проверок разрешений |
 | Application API (`src/packages/application`) | Создание проектов и сессий; команды чата и задач; связывание входов с runtime и портами | UI-компоненты, транспорт HTTP и детали сетевого протокола провайдера |
 | Core / Agent Runtime | Ход сессии, сбор контекста, ответы модели, вызовы инструментов, события и отмена | React, SQLite, OpenRouter, YouTube и другие конкретные адаптеры |
@@ -82,7 +86,7 @@ flowchart TB
 
 ## Целевое направление зависимостей
 
-- UI вызывает application layer через команды и подписывается на состояние/события.
+- Web UI вызывает локальный HTTP host; host преобразует HTTP-запросы в Application use cases. CLI вызывает те же use cases in-process.
 - Application layer использует core и порты инфраструктуры.
 - Core зависит от внутренних типов и интерфейсов портов; конкретные адаптеры подключаются снаружи.
 - Provider adapter реализует порт модели; storage adapter реализует порты чтения/записи; tool runtime реализует реестр/исполнение инструментов с проверкой разрешений.
@@ -93,15 +97,16 @@ flowchart TB
 
 ## Application API и входы: текущее и будущее
 
-Текущий `src/packages/application` предоставляет `createSession`, `sendMessage`, `runAgentTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `createProject` и `replaySession` не реализованы.
+Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `runAgentTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `createProject` и `replaySession` не реализованы.
 
-- CLI — ранний headless host и единственный пользовательский вход первого сквозного среза. Команды позволяют создать сессию, сохранить сообщение без модели, выполнить один ход с явным `--provider fake` или `--provider lm-studio` и прочитать историю. Он вызывает application API, поддерживает JSON-вывод и стабильные коды завершения.
-- Будущий web host должен вызывать те же use cases; текущий статический preview их не вызывает. Если web host окажется в отдельном процессе, способ связи потребуется отдельно решить.
+- CLI — headless host для создания сессий, отправки сообщений и чтения истории. Он вызывает application API, поддерживает JSON-вывод и стабильные коды завершения.
+- Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history` и `POST /api/sessions/:id/messages`. Последний запускает полный application `runAgentTurn`; UI ожидает сохранённый ответ, без streaming.
+- Web host по умолчанию использует Fake provider; LM Studio настраивается переменными окружения. Host слушает `127.0.0.1`, а Vite проксирует браузерные API-запросы.
 - Worker отложен до фонового сценария. Он должен вызывать те же use cases, а не реализовывать собственный цикл агента.
 - Сейчас есть unit/integration-тесты application, storage и providers, а также CLI process-тесты. CLI проверяет реальный процесс и постоянное хранилище между запусками.
-- HTTP API не реализован и добавляется только при появлении удалённого клиента или границы процессов.
+- HTTP host сериализует все изменяющие API-запросы одного процесса. Конкурентная запись из CLI/другого процесса в тот же JSON store не гарантируется.
 
-Команды `provider test`, `eval`, `trace`, `serve`, scheduler и сетевой API не реализованы; их необходимость оценивается отдельно при появлении сценариев.
+Команды `provider test`, `eval`, `trace`, `serve` и scheduler не реализованы. Текущий HTTP host обслуживает только локальный Web-клиент; расширение API для сетевых клиентов требует отдельного решения.
 
 ## Ограниченный agent loop
 
@@ -134,9 +139,10 @@ Application API сохраняет сообщение пользователя, 
 | Unit | Application API с scripted fake provider выполняет один разрешённый вызов тестового инструмента и сохраняет только финальный ответ; отказ и лимиты не запускают повторное исполнение. |
 | Contract | LM Studio adapter преобразует текстовую историю и один tool call в Chat Completions request и проверяет ответ. |
 | Integration | Полная история сессии сохраняется и восстанавливается после перезапуска приложения. |
+| Web API | Fake provider: создать сессию, выполнить turn, перечитать историю; ошибка provider сохраняет user message и возвращает статус хода. |
 | CLI process | Один CLI-процесс выполняет ход через fake provider или локальную HTTP-заглушку LM Studio; следующий процесс читает сообщения пользователя и ассистента в том же порядке. |
 | Replay | Формат событий и воспроизведение хода остаются будущим сценарием. |
-| E2E | Можно создать проект, отправить сообщение, переключить модель и открыть старый чат. |
+| E2E | Можно создать сессию в Web, отправить сообщение, получить ответ и восстановить переписку после перезагрузки страницы. |
 | Security | Запрещённая команда не исполняется без нужного решения permission policy. |
 
 Дополнительно проверяются прерывание streaming, сетевые ошибки, некорректный tool call, закрытие приложения во время операции, миграции БД, повторная отправка сообщения и восстановление после сбоя. Такие сценарии должны опираться на управляемые fake зависимости там, где это возможно.

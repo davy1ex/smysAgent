@@ -7,7 +7,7 @@ import {
   type ToolPermissionPolicy,
 } from "../../packages/core/agent";
 import type { AssistantMessage, Message, Session, SessionHistory, SessionId, UserMessage } from "../../packages/core/session";
-import { createSession, getHistory, runAgentTurn, sendMessage, SessionNotFoundError, type SessionRepository, type UserMessageDraft } from "../../packages/application";
+import { createSession, getHistory, listSessions, runAgentTurn, sendMessage, SessionNotFoundError, type SessionRepository, type UserMessageDraft } from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 
 class MemorySessionRepository implements SessionRepository {
@@ -16,6 +16,15 @@ class MemorySessionRepository implements SessionRepository {
 
   async createSession(session: Session): Promise<void> {
     this.sessions.set(session.id, session);
+  }
+
+  async listSessionHistories(): Promise<SessionHistory[]> {
+    return [...this.sessions.values()].map((session) => ({
+      session,
+      messages: this.messages
+        .filter((message) => message.sessionId === session.id)
+        .sort((left, right) => left.sequence - right.sequence),
+    }));
   }
 
   async appendUserMessage(sessionId: SessionId, draft: UserMessageDraft): Promise<UserMessage | null> {
@@ -88,6 +97,20 @@ test("application API rejects empty text and unknown sessions", async () => {
   await assert.rejects(sendMessage(repository, { sessionId: "missing", text: "hello" }), SessionNotFoundError);
   await assert.rejects(sendMessage(repository, { sessionId: "missing", text: "" }), /must not be empty/);
   await assert.rejects(getHistory(repository, "missing"), SessionNotFoundError);
+});
+
+test("application API lists sessions with titles and activity dates derived from messages", async () => {
+  const repository = new MemorySessionRepository();
+  const older = await createSession(repository);
+  const newer = await createSession(repository);
+  await sendMessage(repository, { sessionId: older.id, text: "  First question  " });
+  await sendMessage(repository, { sessionId: newer.id, text: "Newer question" });
+
+  const sessions = await listSessions(repository);
+
+  assert.deepEqual(new Set(sessions.map(({ id }) => id)), new Set([newer.id, older.id]));
+  assert.equal(sessions.find(({ id }) => id === older.id)?.title, "First question");
+  assert.equal(sessions.find(({ id }) => id === newer.id)?.title, "Newer question");
 });
 
 test("application API runs one provider turn and persists ordered user and assistant messages", async () => {

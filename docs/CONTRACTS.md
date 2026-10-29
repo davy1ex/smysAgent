@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API и CLI фиксируют реализованный внутренний контракт и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004. События и record/replay остаются черновиками будущих сценариев.
+**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004. События и record/replay остаются черновиками будущих сценариев.
 
 ## Принципы проектирования
 
@@ -14,15 +14,15 @@
 
 ## Реализованный Application API и CLI
 
-Application API — внутренний интерфейс use cases, через который host просит приложение выполнить операцию. Реализованные use cases и их сигнатуры приведены ниже. `createProject` и `replaySession` не реализованы.
+Application API — внутренний интерфейс use cases, через который host просит приложение выполнить операцию. CLI вызывает его in-process, локальный Web HTTP host вызывает тот же API из отдельного Node-процесса. `createProject` и `replaySession` не реализованы.
 
-Сейчас эти use cases вызывает CLI; тесты могут вызывать их напрямую с подменёнными портами. Будущий web host должен использовать те же use cases. Если он окажется в отдельном процессе, HTTP adapter может преобразовать запросы в application commands; такого adapter сейчас нет.
+Тесты могут вызывать use cases напрямую с подменёнными портами. React-клиент вызывает HTTP transport и не импортирует Application, Core или providers.
 
 CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход через явно выбранный fake или LM Studio provider и чтение истории. По умолчанию CLI не передаёт инструменты; для smoke-сценария можно явно подключить встроенный `demo.add` и отдельно разрешить его исполнение. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
-Открытыми остаются форма streaming-событий, протокол HTTP (если понадобится), размещение web/backend по процессам и расширение сохранённой схемы.
+Событийный транспорт, сохранённая trajectory, token streaming, projects и расширение схемы хранения остаются будущими задачами.
 
 ### Сигнатуры реализованных use cases
 
@@ -30,12 +30,21 @@ CLI не содержит собственной реализации agent loop
 
 ```ts
 createSession(repository: SessionRepository): Promise<Session>
+listSessions(repository: SessionRepository): Promise<SessionSummary[]>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string }, options?: AgentExecutionOptions): Promise<{ userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
+runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
+
+interface SessionSummary {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  title: string;
+}
 
 interface SessionRepository {
   createSession(session: Session): Promise<void>;
+  listSessionHistories(): Promise<SessionHistory[]>;
   appendUserMessage(sessionId: string, draft: { id: string; createdAt: string; text: string }): Promise<UserMessage | null>;
   appendAssistantMessage(sessionId: string, draft: { id: string; createdAt: string; text: string }): Promise<AssistantMessage | null>;
   getHistory(sessionId: string): Promise<SessionHistory | null>;
@@ -51,7 +60,40 @@ interface TextGenerationProvider {
 }
 ```
 
-`sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Вызов получает или генерирует `runId`; это идентификатор хода без сохранённого execution trace. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+
+### Local Web HTTP API
+
+Host `src/apps/web-host` слушает только `127.0.0.1` (порт по умолчанию `3001`). В dev-режиме Vite проксирует `/api` к этому host. Ответы — JSON; API не использует CORS или аутентификацию.
+
+| Метод и путь | Поведение |
+| --- | --- |
+| `GET /api/sessions` | Возвращает `{ ok, sessions }`; элемент содержит `id`, `createdAt`, `updatedAt`, `title`. |
+| `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию и возвращает `{ ok, session }` с HTTP 201. |
+| `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages }` по `sequence`. |
+| `POST /api/sessions/:id/messages` | Принимает `{ text }`, вызывает `runAgentTurn`, возвращает `runId`, `userMessage` и `assistantMessage`. Запрос ждёт завершения provider; streaming отсутствует. |
+
+Ошибки имеют форму `{ ok: false, error: { code, message, runId?, turnId? } }`. Неверный запрос возвращает 400, отсутствующая сессия — 404, сбой provider/runtime — 502, ошибка хранилища или неизвестная ошибка — 500. При сбое после сохранения user message host возвращает её `turnId`, чтобы UI показал ошибку на соответствующем ходе; безопасное сообщение ошибки не содержит токен или ответ сервера LM Studio.
+
+Изменяющие API-запросы выполняются последовательно в процессе host. Запускать CLI или второй host с тем же `SMYS_DATA_DIR` для параллельной записи нельзя: JSON adapter не синхронизирует процессы.
+
+Запуск из корня репозитория в двух терминалах:
+
+Терминал 1:
+
+```sh
+npm run web:host
+```
+
+Терминал 2:
+
+```sh
+cd src/apps/web && npm run dev
+```
+
+Для LM Studio в первом терминале задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<model-id>` перед `npm run web:host`.
+
+Fake provider используется по умолчанию. Для LM Studio задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint берётся из `LM_STUDIO_ENDPOINT` или `http://localhost:1234/v1/chat/completions`, токен — из необязательного `LM_API_TOKEN`. `SMYS_DATA_DIR` задаёт каталог JSON store, `SMYS_WEB_PORT` — порт API, `SMYS_API_URL` — target Vite proxy.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -74,13 +116,13 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 {"ok":true,"session":{"id":"...","createdAt":"..."},"message":{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."}}
 {"ok":true,"message":{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."}}
 {"ok":true,"sessionId":"...","messages":[{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."}]}
-{"ok":true,"userMessage":{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."},"assistantMessage":{"id":"...","sessionId":"...","sequence":2,"role":"assistant","content":[{"type":"text","text":"Fake response to: ..."}],"createdAt":"..."}}
+{"ok":true,"runId":"...","userMessage":{"id":"...","sessionId":"...","sequence":1,"role":"user","content":[{"type":"text","text":"..."}],"createdAt":"..."},"assistantMessage":{"id":"...","sessionId":"...","sequence":2,"role":"assistant","content":[{"type":"text","text":"Fake response to: ..."}],"createdAt":"..."}}
 ```
 
 Для provider, вернувшего reasoning, `agent run` добавляет его отдельным верхнеуровневым полем:
 
 ```json
-{"ok":true,"userMessage":{"id":"..."},"assistantMessage":{"id":"...","role":"assistant","content":[{"type":"text","text":"..."}]},"reasoning":"..."}
+{"ok":true,"runId":"...","userMessage":{"id":"..."},"assistantMessage":{"id":"...","role":"assistant","content":[{"type":"text","text":"..."}]},"reasoning":"..."}
 ```
 
 Каждый ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища. Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. Без `--json` используются краткие текстовые сообщения.

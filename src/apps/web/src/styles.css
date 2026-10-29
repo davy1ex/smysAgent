@@ -46,6 +46,8 @@ button:disabled { opacity: 1; cursor: default; }
 .sidebar-label, .projects-heading { color: #6d6f71; font: 600 9px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .09em; }
 .sidebar-label { padding-inline: 8px; }
 .new-chat-button { display: flex; min-height: 34px; align-items: center; gap: 9px; padding: 0 9px; border: 1px solid #343538; border-radius: 7px; color: #d9dad7; background: #222326; font-size: 11px; text-align: left; }
+.new-chat-button { cursor: pointer; }
+.new-chat-button:hover { border-color: #48494b; background: #292a2d; }
 .new-chat-button svg { color: #a7a9a5; }
 .new-chat-button kbd { margin-left: auto; padding: 2px 5px; border: 1px solid #393a3d; border-radius: 4px; color: #747678; background: #1c1d1f; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .projects-heading { display: flex; align-items: center; justify-content: space-between; margin: 25px 7px 7px; }
@@ -105,6 +107,18 @@ button:disabled { opacity: 1; cursor: default; }
 .message-meta strong { color: #c6c8c4; font-size: 10px; font-weight: 550; }
 .message-meta time { margin-left: auto; color: #626466; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .message-content p { margin: 6px 0 0; color: #d2d3d0; font-size: 11px; line-height: 1.65; }
+.turn-status { display: flex; align-items: center; gap: 5px; margin-top: 7px; font-size: 9px; line-height: 1.4; }
+.turn-status svg { flex: 0 0 auto; }
+.turn-pending { color: var(--running); }
+.turn-pending svg { animation: rotate 1.5s linear infinite; }
+.turn-completed { color: var(--success); }
+.turn-error { color: var(--error); }
+.empty-conversation { padding: 32px 12px; color: #797b7d; font-size: 11px; text-align: center; }
+.empty-state { display: flex; height: 100%; min-height: 200px; flex-direction: column; align-items: center; justify-content: center; gap: 11px; color: #828482; font-size: 11px; }
+.empty-state > svg { color: #a1a49d; }
+.empty-state > strong { color: #d4d6d1; font-size: 14px; font-weight: 550; }
+.empty-state > button { margin-top: 5px; padding: 8px 12px; border: 1px solid #414245; border-radius: 6px; color: #dedfdb; background: #222326; cursor: pointer; }
+.empty-state > button:hover { background: #2b2c2f; }
 .assistant-avatar, .user-avatar { display: grid; width: 25px; height: 25px; flex: 0 0 auto; place-items: center; border: 1px solid #3b3d39; border-radius: 7px; color: #c5c8bf; background: #202220; }
 .user-avatar { width: 22px; height: 22px; border-radius: 50%; color: #b9bbb7; background: #2a2b2d; font-size: 9px; }
 
@@ -194,6 +208,8 @@ button:disabled { opacity: 1; cursor: default; }
 .composer-dock { z-index: 1; padding: 12px max(24px, calc((100% - 820px) / 2)) 10px; border-top: 1px solid #242528; background: #111214; }
 .composer { padding: 9px 10px 7px 12px; border: 1px solid #343537; border-radius: 8px; background: #191a1c; }
 .composer textarea { display: block; width: 100%; min-height: 25px; resize: none; border: 0; outline: 0; color: #aaa; background: transparent; font-size: 10px; line-height: 1.55; }
+.composer textarea { color: #d4d5d2; }
+.composer textarea:disabled { opacity: .7; }
 .composer textarea::placeholder { color: #747678; }
 .composer-toolbar { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
 .composer-icon-button { display: grid; width: 25px; height: 25px; place-items: center; border: 0; border-radius: 5px; color: #858789; background: transparent; }
@@ -201,6 +217,10 @@ button:disabled { opacity: 1; cursor: default; }
 .composer-model { color: #a9aba7; }
 .send-button { display: grid; width: 26px; height: 26px; place-items: center; border: 1px solid #363739; border-radius: 6px; color: #77797a; background: #252629; }
 .composer-note { margin: 6px 0 0; color: #606264; font-size: 8px; text-align: center; }
+.composer-toolbar .composer-note { margin: 0; text-align: left; }
+.composer-error { margin: 7px 2px 0; color: var(--error); font-size: 10px; }
+.send-button:not(:disabled) { color: #dfe1dc; background: #303134; cursor: pointer; }
+.send-button:not(:disabled):hover { border-color: #55575a; background: #3a3b3e; }
 
 @keyframes rotate { to { transform: rotate(360deg); } }
 @media (max-width: 900px) and (min-width: 761px) {
@@ -240,6 +260,7 @@ button:disabled { opacity: 1; cursor: default; }
   .trajectory-intro { margin-bottom: 11px; }
   .composer-dock { padding: 9px 12px max(8px, env(safe-area-inset-bottom)); }
   .composer-note { display: none; }
+  .composer-error { margin-top: 6px; }
 }
 
 @media (max-width: 390px) {

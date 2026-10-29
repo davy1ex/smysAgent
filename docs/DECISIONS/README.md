@@ -8,7 +8,7 @@ AI может исследовать варианты, подготовить п
 
 ## Принятые решения
 
-- [ADR-0001: Headless-first application API и CLI](ADR-0001-headless-first.md) — внутренний application API и минимальный CLI входят в первый исполняемый срез; HTTP и worker отложены до конкретной потребности.
+- [ADR-0001: Headless-first application API и CLI](ADR-0001-headless-first.md) — единый внутренний Application API и CLI; локальный Web transport принят позднее в ADR-0009.
 - [ADR-0002: Один ход через fake provider и store v2](ADR-0002-fake-agent-turn-store-v2.md) — CLI выполняет явный детерминированный ход; JSON-хранилище принимает сообщения пользователя и ассистента и мигрирует v1 при первой записи.
 - [ADR-0003: LM Studio через OpenAI-compatible Chat Completions](ADR-0003-lm-studio-provider.md) — первый реальный provider передаёт полную историю одним non-streaming запросом без изменения application API и формата хранилища.
 - [ADR-0004: Ограниченный agent loop с одним инструментом](ADR-0004-bounded-agent-tool-loop.md) — до двух вызовов модели и одного вызова инструмента за ход; runtime проверяет разрешение, а tool-сообщения не попадают в store v2.
@@ -16,6 +16,7 @@ AI может исследовать варианты, подготовить п
 - [ADR-0006: Причина ошибки исполнения инструмента](ADR-0006-tool-error-cause.md) — runtime сохраняет исходную причину в `cause`, оставляя CLI безопасное сообщение ошибки.
 - [ADR-0007: Статический React web-макет](ADR-0007-static-react-web-preview.md) — отдельный Vite-пакет для оценки чата на локальных UI-фикстурах без подключения Application API.
 - [ADR-0008: Shell и компактная лента агента](ADR-0008-ui-shell-compact-timeline.md) — локальная навигация по демо-сессиям, вкладки Chat/Trajectory и три состояния tool call без изменения backend-контрактов.
+- [ADR-0009: Локальный HTTP host для Web](ADR-0009-local-web-host.md) — браузер вызывает Application API через loopback Node host; provider и JSON store остаются на стороне host.
 
 ## Шаблон
 
@@ -41,4 +42,4 @@ AI может исследовать варианты, подготовить п
 
 ## Открытые темы
 
-Выбор SQLite и схема БД, desktop shell (включая возможный Tauri), модели исполнения плагинов, provider capabilities, streaming, политика хранения и формат record/replay не утверждены. HTTP API и worker/daemon отложены до конкретных сценариев. Создавать ADR нужно при подготовке конкретного решения, а не заполнять заранее выбранными технологиями.
+Выбор SQLite и схема БД, desktop shell (включая возможный Tauri), модели исполнения плагинов, provider capabilities, streaming, политика хранения и формат record/replay не утверждены. Worker/daemon отложен до фонового сценария. Создавать ADR нужно при подготовке конкретного решения, а не заполнять заранее выбранными технологиями.
