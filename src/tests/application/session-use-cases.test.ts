@@ -7,7 +7,7 @@ import {
   type ToolPermissionPolicy,
 } from "../../packages/core/agent";
 import type { AssistantMessage, Message, Session, SessionHistory, SessionId, UserMessage } from "../../packages/core/session";
-import { createSession, getHistory, listSessions, runAgentTurn, sendMessage, SessionNotFoundError, type SessionRepository, type UserMessageDraft } from "../../packages/application";
+import { createSession, getHistory, listSessions, runAgentTurn, runAgentTurnStreaming, sendMessage, SessionNotFoundError, type SessionRepository, type UserMessageDraft } from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 
 class MemorySessionRepository implements SessionRepository {
@@ -140,6 +140,72 @@ test("application API runs one provider turn and persists ordered user and assis
     ["user", "hello"],
     ["assistant", "deterministic reply"],
   ]);
+});
+
+test("application streaming turn forwards deltas and persists their final text once", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const chunks: string[] = [];
+  const provider = {
+    async generate() {
+      throw new Error("Streaming path should not call generate().");
+    },
+    async *streamText() {
+      yield "streamed ";
+      yield "reply";
+    },
+  };
+  let startedUser: UserMessage | undefined;
+  const turn = await runAgentTurnStreaming(
+    repository,
+    provider,
+    { sessionId: session.id, text: "hello" },
+    {
+      onStarted(_runId, userMessage) { startedUser = userMessage; },
+      onTextDelta(delta) { chunks.push(delta); },
+    },
+  );
+  const history = await getHistory(repository, session.id);
+
+  assert.deepEqual(chunks, ["streamed ", "reply"]);
+  assert.equal(startedUser?.id, turn.userMessage.id);
+  assert.equal(turn.assistantMessage.content[0]?.text, "streamed reply");
+  assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
+    ["user", "hello"],
+    ["assistant", "streamed reply"],
+  ]);
+});
+
+test("application streaming cancellation leaves the user message without a false assistant completion", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const controller = new AbortController();
+  const provider = {
+    async generate() {
+      throw new Error("Streaming path should not call generate().");
+    },
+    async *streamText(_request: unknown, options?: { signal?: AbortSignal }) {
+      yield "partial";
+      options?.signal?.throwIfAborted();
+      yield "unreachable";
+    },
+  };
+
+  await assert.rejects(
+    runAgentTurnStreaming(
+      repository,
+      provider,
+      { sessionId: session.id, text: "stop this" },
+      {
+        signal: controller.signal,
+        onStarted() {},
+        onTextDelta() { controller.abort(); },
+      },
+    ),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+  const history = await getHistory(repository, session.id);
+  assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
 });
 
 test("application API executes one permitted tool and persists only the final answer", async () => {

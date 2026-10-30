@@ -7,8 +7,10 @@ import {
   InvalidArgumentError,
   listSessions,
   runAgentTurn,
+  runAgentTurnStreaming,
   SessionNotFoundError,
   type SessionRepository,
+  type StreamingTextGenerationProvider,
   type TextGenerationProvider,
 } from "../../packages/application";
 import { LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
@@ -67,6 +69,38 @@ async function handleRequest(
       return;
     }
 
+    const streamRoute = /^\/api\/sessions\/([^/]+)\/messages\/stream$/.exec(url.pathname);
+    if (streamRoute !== null && request.method === "POST") {
+      const sessionId = decodePathSegment(streamRoute[1]);
+      const body = await readJsonBody(request);
+      if (typeof body.text !== "string") {
+        throw new InvalidArgumentError("Message text must be a string.");
+      }
+      const runId = randomUUID();
+      const abortController = new AbortController();
+      const abortOnRequest = () => abortController.abort();
+      const abortOnResponseClose = () => {
+        if (!response.writableEnded) abortController.abort();
+      };
+      request.once("aborted", abortOnRequest);
+      response.once("close", abortOnResponseClose);
+      try {
+        await serializeMutation(() => streamTurnResponse(
+          repository,
+          provider,
+          sessionId,
+          body.text as string,
+          runId,
+          response,
+          abortController.signal,
+        ));
+      } finally {
+        request.off("aborted", abortOnRequest);
+        response.off("close", abortOnResponseClose);
+      }
+      return;
+    }
+
     const messageRoute = /^\/api\/sessions\/([^/]+)\/messages$/.exec(url.pathname);
     if (messageRoute !== null && request.method === "POST") {
       const sessionId = decodePathSegment(messageRoute[1]);
@@ -107,6 +141,100 @@ async function handleRequest(
     const failure = toApiFailure(error);
     sendJson(response, failure.status, failure.body);
   }
+}
+
+async function streamTurnResponse(
+  repository: SessionRepository,
+  provider: TextGenerationProvider,
+  sessionId: string,
+  text: string,
+  runId: string,
+  response: ServerResponse,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted || response.destroyed) return;
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-content-type-options": "nosniff",
+  });
+  response.flushHeaders();
+  let turnId: string | undefined;
+
+  try {
+    if (!isStreamingProvider(provider)) {
+      throw new StreamingNotSupportedError();
+    }
+    const turn = await runAgentTurnStreaming(
+      repository,
+      provider,
+      { sessionId, text, runId },
+      {
+        signal,
+        onStarted: async (startedRunId, userMessage) => {
+          turnId = userMessage.id;
+          await writeSse(response, signal, "turn.started", { runId: startedRunId, userMessage });
+        },
+        onTextDelta: (delta) => writeSse(response, signal, "assistant.delta", { runId, text: delta }),
+      },
+    );
+    await writeSse(response, signal, "turn.completed", {
+      runId: turn.runId,
+      assistantMessage: turn.assistantMessage,
+    });
+  } catch (error) {
+    if (signal.aborted || response.destroyed) return;
+    const failure = toApiFailure(error);
+    const apiError = failure.body.error as Record<string, unknown>;
+    await writeSse(response, signal, "turn.failed", {
+      runId,
+      error: {
+        ...apiError,
+        runId,
+        ...(turnId === undefined ? {} : { turnId }),
+      },
+    });
+  } finally {
+    if (!response.destroyed && !response.writableEnded) response.end();
+  }
+}
+
+function isStreamingProvider(provider: TextGenerationProvider): provider is TextGenerationProvider & StreamingTextGenerationProvider {
+  return "streamText" in provider && typeof provider.streamText === "function";
+}
+
+async function writeSse(
+  response: ServerResponse,
+  signal: AbortSignal,
+  event: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  signal.throwIfAborted();
+  if (response.destroyed || response.writableEnded) return;
+  if (!response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)) {
+    await waitForDrain(response, signal);
+  }
+}
+
+function waitForDrain(response: ServerResponse, signal: AbortSignal): Promise<void> {
+  return new Promise((resolveDrain, rejectDrain) => {
+    const cleanup = () => {
+      response.off("drain", onDrain);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolveDrain();
+    };
+    const onAbort = () => {
+      cleanup();
+      rejectDrain(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"));
+    };
+    response.once("drain", onDrain);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
 }
 
 async function findFailedUserMessageId(
@@ -180,6 +308,9 @@ function toApiFailure(error: unknown): ApiFailure {
   if (error instanceof LmStudioProviderError) {
     return failure(502, "PROVIDER_ERROR", error.message);
   }
+  if (error instanceof StreamingNotSupportedError) {
+    return failure(502, "STREAMING_UNSUPPORTED", error.message);
+  }
   if (error instanceof AgentRuntimeError) {
     return failure(502, error.code, error.message);
   }
@@ -191,7 +322,7 @@ function failure(status: number, code: string, message: string): ApiFailure {
 }
 
 function sendJson(response: ServerResponse, status: number, body: Record<string, unknown>): void {
-  if (response.headersSent) return;
+  if (response.headersSent || response.destroyed) return;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -201,3 +332,9 @@ function sendJson(response: ServerResponse, status: number, body: Record<string,
 }
 
 class HttpInputError extends Error {}
+class StreamingNotSupportedError extends Error {
+  constructor() {
+    super("The configured provider does not support text streaming.");
+    this.name = "StreamingNotSupportedError";
+  }
+}

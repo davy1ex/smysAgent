@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004. События и record/replay остаются черновиками будущих сценариев.
+**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; end-to-end text streaming — в ADR-0010. Agent events, record/replay и сохранённая trajectory остаются будущими сценариями.
 
 ## Принципы проектирования
 
@@ -22,7 +22,7 @@ CLI — ранний headless-вход для ручного запуска, с�
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
-Событийный транспорт, сохранённая trajectory, token streaming, projects и расширение схемы хранения остаются будущими задачами.
+Agent event streaming, сохранённая trajectory, projects и расширение схемы хранения остаются будущими задачами. Потоковый текст Web описан в отдельном HTTP-контракте ниже; это не журнал событий agent loop.
 
 ### Сигнатуры реализованных use cases
 
@@ -33,6 +33,7 @@ createSession(repository: SessionRepository): Promise<Session>
 listSessions(repository: SessionRepository): Promise<SessionSummary[]>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
 runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
+runAgentTurnStreaming(repository: SessionRepository, provider: TextGenerationProvider & StreamingTextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, handlers: AgentTurnStreamHandlers, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }>
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
 
 interface SessionSummary {
@@ -58,13 +59,23 @@ interface AgentExecutionOptions {
 interface TextGenerationProvider {
   generate(request: ModelRequest): Promise<ModelResponse>;
 }
+
+interface StreamingTextGenerationProvider {
+  streamText(request: ModelRequest, options?: { signal?: AbortSignal }): AsyncIterable<string>;
+}
+
+interface AgentTurnStreamHandlers {
+  onStarted(runId: string, userMessage: UserMessage): void | Promise<void>;
+  onTextDelta(text: string): void | Promise<void>;
+  signal?: AbortSignal;
+}
 ```
 
 `listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Вызов получает или генерирует `runId`; это идентификатор хода без сохранённого execution trace. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
 ### Local Web HTTP API
 
-Host `src/apps/web-host` слушает только `127.0.0.1` (порт по умолчанию `3001`). В dev-режиме Vite проксирует `/api` к этому host. Ответы — JSON; API не использует CORS или аутентификацию.
+Host `src/apps/web-host` слушает только `127.0.0.1` (порт по умолчанию `3001`). В dev-режиме Vite проксирует `/api` к этому host. API не использует CORS или аутентификацию; потоковый endpoint отвечает `text/event-stream`, остальные endpoints — JSON.
 
 | Метод и путь | Поведение |
 | --- | --- |
@@ -72,6 +83,9 @@ Host `src/apps/web-host` слушает только `127.0.0.1` (порт по 
 | `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию и возвращает `{ ok, session }` с HTTP 201. |
 | `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages }` по `sequence`. |
 | `POST /api/sessions/:id/messages` | Принимает `{ text }`, вызывает `runAgentTurn`, возвращает `runId`, `userMessage` и `assistantMessage`. Запрос ждёт завершения provider; streaming отсутствует. |
+| `POST /api/sessions/:id/messages/stream` | Принимает `{ text }`, вызывает `runAgentTurnStreaming` и возвращает SSE события `turn.started`, `assistant.delta`, `turn.completed` или `turn.failed`. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. Поддерживаются только ходы без tools. |
+
+Формат SSE события — `event: <type>` и одна JSON-строка `data:`. `turn.started` содержит `{ runId, userMessage }`; `assistant.delta` — `{ runId, text }`; `turn.completed` — `{ runId, assistantMessage }`; `turn.failed` — `{ runId, error: { code, message, turnId? } }`. Начальное событие отправляется после сохранения user message. Текстовые чанки временные и не записываются отдельно; Application сохраняет объединённый ответ один раз только после корректного завершения provider. `turn.completed` отправляется после успешной записи assistant message. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
 
 Ошибки имеют форму `{ ok: false, error: { code, message, runId?, turnId? } }`. Неверный запрос возвращает 400, отсутствующая сессия — 404, сбой provider/runtime — 502, ошибка хранилища или неизвестная ошибка — 500. При сбое после сохранения user message host возвращает её `turnId`, чтобы UI показал ошибку на соответствующем ходе; безопасное сообщение ошибки не содержит токен или ответ сервера LM Studio.
 
@@ -209,7 +223,7 @@ interface AgentTurnResult {
 }
 ```
 
-Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false` и читает reasoning из `reasoning_content`. Если переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Runtime возвращает reasoning всех вызовов модели за ход в порядке получения, разделяя части пустой строкой. Ошибки соединения, HTTP, формата ответа и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Streaming, capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
+Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. `generate()` в LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false` и читает reasoning из `reasoning_content`. Для Web text streaming `streamText()` отправляет `stream: true`, разбирает OpenAI-compatible SSE data и выдаёт только `delta.content`; reasoning не отображается как текст, а tool calls в этом режиме отклоняются. Если для обычного `generate()` переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Runtime возвращает reasoning всех вызовов модели за обычный ход в порядке получения, разделяя части пустой строкой. Ошибки соединения, HTTP, формата ответа, незавершённого потока и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
 
 ## Ограниченный контракт инструментов и разрешений
 

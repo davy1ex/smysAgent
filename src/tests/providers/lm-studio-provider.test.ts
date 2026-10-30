@@ -72,6 +72,101 @@ test("LM Studio provider omits authorization when no token is configured", async
   assert.equal(requestHeaders?.has("authorization"), false);
 });
 
+test("LM Studio provider streams text deltas from an OpenAI-compatible SSE response", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return sseResponse([
+        'data: {"choices":[{"delta":{"content":"first "}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"second"}}]}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    },
+  });
+
+  const chunks: string[] = [];
+  for await (const delta of provider.streamText(request)) chunks.push(delta);
+
+  assert.deepEqual(chunks, ["first ", "second"]);
+  assert.deepEqual(requestBody, {
+    model: "model-id",
+    messages: request.messages,
+    stream: true,
+  });
+});
+
+test("LM Studio provider yields a token before the upstream stream completes", async () => {
+  let releaseStream: (() => void) | undefined;
+  const streamGate = new Promise<void>((resolve) => { releaseStream = resolve; });
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async () => new Response(new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"early"}}]}\n\n'));
+        await streamGate;
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+  });
+
+  const iterator = provider.streamText(request)[Symbol.asyncIterator]();
+  assert.deepEqual(await iterator.next(), { value: "early", done: false });
+  releaseStream?.();
+  assert.deepEqual(await iterator.next(), { value: undefined, done: true });
+});
+
+test("LM Studio provider rejects an interrupted SSE response without a done marker", async () => {
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async () => sseResponse(['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']),
+  });
+
+  const chunks: string[] = [];
+  await assert.rejects(
+    async () => { for await (const delta of provider.streamText(request)) chunks.push(delta); },
+    (error: unknown) => error instanceof LmStudioProviderError && error.message === "LM Studio text stream ended unexpectedly.",
+  );
+  assert.deepEqual(chunks, ["partial"]);
+});
+
+test("LM Studio provider propagates cancellation to the upstream stream", async () => {
+  const controller = new AbortController();
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async (_input, init) => {
+      assert.equal(init?.signal, controller.signal);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        },
+        cancel() {},
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const iterator = provider.streamText(request, { signal: controller.signal })[Symbol.asyncIterator]();
+
+  assert.deepEqual(await iterator.next(), { value: "partial", done: false });
+  controller.abort();
+  await assert.rejects(iterator.next(), (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+});
+
+function sseResponse(chunks: readonly string[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
 test("LM Studio provider returns reasoning separately from the final text", async () => {
   const provider = new LmStudioProvider({
     endpoint,

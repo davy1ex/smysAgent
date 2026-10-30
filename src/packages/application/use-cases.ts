@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { runAgentTurn as generateAgentReply, type TextGenerationProvider } from "../core/agent";
+import {
+  runAgentTurn as generateAgentReply,
+  streamAgentTurn as generateAgentReplyStream,
+  type StreamingTextGenerationProvider,
+  type TextGenerationProvider,
+} from "../core/agent";
 import type { AssistantMessage, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
 import type { AgentExecutionOptions, SessionRepository } from "./ports";
@@ -89,6 +94,49 @@ export async function runAgentTurn(
     assistantMessage,
     ...(result.reasoning === undefined ? {} : { reasoning: result.reasoning }),
   };
+}
+
+export interface AgentTurnStreamHandlers {
+  onStarted(runId: string, userMessage: UserMessage): void | Promise<void>;
+  onTextDelta(text: string): void | Promise<void>;
+  signal?: AbortSignal;
+}
+
+export async function runAgentTurnStreaming(
+  repository: SessionRepository,
+  provider: TextGenerationProvider & StreamingTextGenerationProvider,
+  input: { sessionId: SessionId; text: string; runId?: string },
+  handlers: AgentTurnStreamHandlers,
+  agentOptions: AgentExecutionOptions = {},
+): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }> {
+  if ((agentOptions.tools?.length ?? 0) > 0) {
+    throw new InvalidArgumentError("Streaming turns do not support tools.");
+  }
+  const runId = input.runId ?? randomUUID();
+  if (runId.length === 0) {
+    throw new InvalidArgumentError("runId must not be empty.");
+  }
+  handlers.signal?.throwIfAborted();
+  const userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
+  await handlers.onStarted(runId, userMessage);
+  handlers.signal?.throwIfAborted();
+  const history = await getHistory(repository, input.sessionId);
+  const result = await generateAgentReplyStream(history.messages, provider, {
+    sessionId: input.sessionId,
+    ...agentOptions,
+    onTextDelta: handlers.onTextDelta,
+    ...(handlers.signal === undefined ? {} : { signal: handlers.signal }),
+  });
+  handlers.signal?.throwIfAborted();
+  const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
+    id: randomUUID(),
+    createdAt: new Date().toISOString(),
+    text: result.text,
+  });
+  if (assistantMessage === null) {
+    throw new SessionNotFoundError(input.sessionId);
+  }
+  return { runId, userMessage, assistantMessage };
 }
 
 export async function getHistory(

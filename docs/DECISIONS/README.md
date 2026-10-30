@@ -17,6 +17,7 @@ AI может исследовать варианты, подготовить п
 - [ADR-0007: Статический React web-макет](ADR-0007-static-react-web-preview.md) — отдельный Vite-пакет для оценки чата на локальных UI-фикстурах без подключения Application API.
 - [ADR-0008: Shell и компактная лента агента](ADR-0008-ui-shell-compact-timeline.md) — локальная навигация по демо-сессиям, вкладки Chat/Trajectory и три состояния tool call без изменения backend-контрактов.
 - [ADR-0009: Локальный HTTP host для Web](ADR-0009-local-web-host.md) — браузер вызывает Application API через loopback Node host; provider и JSON store остаются на стороне host.
+- [ADR-0010: End-to-end text streaming](ADR-0010-end-to-end-text-streaming.md) — отдельный SSE endpoint передаёт текстовые чанки Web-клиенту; финальный ответ сохраняется после чистого завершения потока.
 
 ## Шаблон
 
@@ -42,4 +43,4 @@ AI может исследовать варианты, подготовить п
 
 ## Открытые темы
 
-Выбор SQLite и схема БД, desktop shell (включая возможный Tauri), модели исполнения плагинов, provider capabilities, streaming, политика хранения и формат record/replay не утверждены. Worker/daemon отложен до фонового сценария. Создавать ADR нужно при подготовке конкретного решения, а не заполнять заранее выбранными технологиями.
+Выбор SQLite и схема БД, desktop shell (включая возможный Tauri), модели исполнения плагинов, расширение provider capabilities, политика хранения и формат record/replay не утверждены. Worker/daemon отложен до фонового сценария. Создавать ADR нужно при подготовке конкретного решения, а не заполнять заранее выбранными технологиями.

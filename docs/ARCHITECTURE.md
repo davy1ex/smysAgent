@@ -4,7 +4,7 @@
 
 ## Текущая реализация
 
-В репозитории реализованы два host: CLI напрямую вызывает application use cases, а браузерный Web-клиент обращается к тем же use cases через локальный HTTP host. Application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет восстановить историю после перезапуска. Core/application реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
+В репозитории реализованы два host: CLI напрямую вызывает application use cases, а браузерный Web-клиент обращается к тем же use cases через локальный HTTP host. Application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет восстановить историю после перезапуска. Web может читать текстовые чанки через SSE; финальный ответ сохраняется один раз после корректного окончания генерации. Core/application также реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
 
 ```text
 src/apps/cli/{demo-tools,main,smoke-lm-studio}.ts
@@ -19,7 +19,7 @@ src/tests/{application,cli,providers,storage,web-host}/
 docs/
 ```
 
-`src/apps/web` показывает реальные сессии и сообщения из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает Application use cases и выбирает Fake или LM Studio. Проекты и runtime events пока не реализованы: группа сессий называется «Без проекта», а вкладка истории показывает только сохранённые сообщения. Pending/error относятся к текущему пользовательскому ходу в UI; reasoning и tool calls не выдаются за сохранённую trajectory. Web host сериализует изменяющие HTTP-запросы в одном процессе; CLI не должен одновременно записывать тот же JSON store. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
+`src/apps/web` показывает реальные сессии и сообщения из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает Application use cases и выбирает Fake или LM Studio. Проекты и agent event streaming пока не реализованы: группа сессий называется «Без проекта», а вкладка истории показывает только сохранённые сообщения. Текущий текстовый поток является временным UI-состоянием; reasoning и tool calls не выдаются за сохранённую trajectory. Web host сериализует изменяющие HTTP-запросы в одном процессе; CLI не должен одновременно записывать тот же JSON store. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
 
 ## Целевая модель
 
@@ -97,10 +97,10 @@ flowchart TB
 
 ## Application API и входы: текущее и будущее
 
-Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `runAgentTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `createProject` и `replaySession` не реализованы.
+Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `runAgentTurn`, `runAgentTurnStreaming` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. Потоковый use case принимает текстовые чанки через callback, поддерживает отмену и не сохраняет частичный ответ. `createProject` и `replaySession` не реализованы.
 
 - CLI — headless host для создания сессий, отправки сообщений и чтения истории. Он вызывает application API, поддерживает JSON-вывод и стабильные коды завершения.
-- Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history` и `POST /api/sessions/:id/messages`. Последний запускает полный application `runAgentTurn`; UI ожидает сохранённый ответ, без streaming.
+- Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и `POST /api/sessions/:id/messages/stream`. Последний использует SSE и `runAgentTurnStreaming`; отмена запроса передаётся provider.
 - Web host по умолчанию использует Fake provider; LM Studio настраивается переменными окружения. Host слушает `127.0.0.1`, а Vite проксирует браузерные API-запросы.
 - Worker отложен до фонового сценария. Он должен вызывать те же use cases, а не реализовывать собственный цикл агента.
 - Сейчас есть unit/integration-тесты application, storage и providers, а также CLI process-тесты. CLI проверяет реальный процесс и постоянное хранилище между запусками.

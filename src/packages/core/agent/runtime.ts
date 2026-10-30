@@ -1,6 +1,11 @@
 import type { Message, SessionId } from "../session";
 import { AgentRuntimeError } from "./errors";
-import type { ModelMessage, ModelResponse, TextGenerationProvider } from "./model";
+import type {
+  ModelMessage,
+  ModelResponse,
+  StreamingTextGenerationProvider,
+  TextGenerationProvider,
+} from "./model";
 import type { AgentTool, ToolCall, ToolPermissionPolicy } from "./tool";
 
 export interface AgentTurnResult {
@@ -12,6 +17,11 @@ export interface AgentRuntimeOptions {
   sessionId: SessionId;
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
+}
+
+export interface AgentTextStreamOptions extends AgentRuntimeOptions {
+  onTextDelta(text: string): void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 const MAX_MODEL_CALLS = 2;
@@ -57,6 +67,39 @@ export async function runAgentTurn(
   }
 
   throw new AgentRuntimeError("LOOP_LIMIT", "The agent turn exceeded its model-call limit.");
+}
+
+export async function streamAgentTurn(
+  messages: readonly Message[],
+  provider: StreamingTextGenerationProvider,
+  options: AgentTextStreamOptions,
+): Promise<AgentTurnResult> {
+  if ((options.tools?.length ?? 0) > 0) {
+    throw new AgentRuntimeError("INVALID_CONFIGURATION", "Streaming turns do not support tools.");
+  }
+  validateConfiguration(options);
+  options.signal?.throwIfAborted();
+
+  const conversation = createModelConversation(messages);
+  const textParts: string[] = [];
+  for await (const delta of provider.streamText({ messages: conversation, tools: [] }, {
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  })) {
+    options.signal?.throwIfAborted();
+    if (typeof delta !== "string") {
+      throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid text chunk.");
+    }
+    if (delta.length === 0) continue;
+    textParts.push(delta);
+    await options.onTextDelta(delta);
+  }
+  options.signal?.throwIfAborted();
+
+  const text = textParts.join("");
+  if (text.length === 0) {
+    throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an empty response.");
+  }
+  return { text };
 }
 
 function validateConfiguration(options: AgentRuntimeOptions): readonly AgentTool[] {

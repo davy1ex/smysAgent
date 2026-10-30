@@ -156,6 +156,201 @@ test("local Web API runs a turn through the configured LM Studio provider", asyn
   }
 });
 
+test("streaming Web API delivers deltas before model completion and persists once before completed", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-"));
+  const repository = new JsonFileSessionRepository(dataDir);
+  let releaseModel: (() => void) | undefined;
+  const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
+  const provider = {
+    async generate() {
+      throw new Error("Streaming route should use streamText().");
+    },
+    async *streamText() {
+      yield "early ";
+      await modelGate;
+      yield "reply";
+    },
+  };
+  const server = createWebApiServer({ repository, provider });
+
+  try {
+    const baseUrl = await listen(server);
+    const created = await createWebSession(baseUrl);
+    const response = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/messages/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({ text: "stream this" }),
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+    const readEvent = createSseEventReader(response.body!.getReader());
+    const started = await readEvent();
+    const firstDelta = await readEvent();
+    assert.equal(started.event, "turn.started");
+    assert.equal(firstDelta.event, "assistant.delta");
+    assert.equal((firstDelta.data as { text: string }).text, "early ");
+
+    const inProgress = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
+      messages: Array<{ role: string }>;
+    };
+    assert.deepEqual(inProgress.messages.map((message) => message.role), ["user"]);
+    releaseModel?.();
+
+    const secondDelta = await readEvent();
+    const completed = await readEvent();
+    assert.equal(secondDelta.event, "assistant.delta");
+    assert.equal((secondDelta.data as { text: string }).text, "reply");
+    assert.equal(completed.event, "turn.completed");
+    const history = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
+      messages: Array<{ role: string; content: Array<{ text: string }> }>;
+    };
+    assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
+      ["user", "stream this"],
+      ["assistant", "early reply"],
+    ]);
+  } finally {
+    releaseModel?.();
+    await close(server);
+    await repository.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("streaming Web API reports provider failure without persisting partial assistant text", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-failure-"));
+  const repository = new JsonFileSessionRepository(dataDir);
+  const provider = new LmStudioProvider({
+    endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+    model: "test-model",
+    fetcher: async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+  });
+  const server = createWebApiServer({ repository, provider });
+
+  try {
+    const baseUrl = await listen(server);
+    const created = await createWebSession(baseUrl);
+    const response = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/messages/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "fail after partial" }),
+    });
+    const readEvent = createSseEventReader(response.body!.getReader());
+    assert.equal((await readEvent()).event, "turn.started");
+    assert.equal((await readEvent()).event, "assistant.delta");
+    const failed = await readEvent();
+    assert.equal(failed.event, "turn.failed");
+    assert.equal((failed.data as { error: { code: string } }).error.code, "PROVIDER_ERROR");
+    const history = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
+      messages: Array<{ role: string }>;
+    };
+    assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
+  } finally {
+    await close(server);
+    await repository.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("disconnecting a streaming Web request aborts provider generation", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-abort-"));
+  const repository = new JsonFileSessionRepository(dataDir);
+  let resolveCancelled: (() => void) | undefined;
+  const cancelled = new Promise<void>((resolve) => { resolveCancelled = resolve; });
+  const provider = {
+    async generate() {
+      throw new Error("Streaming route should use streamText().");
+    },
+    async *streamText(_request: unknown, options?: { signal?: AbortSignal }) {
+      yield "partial";
+      await new Promise<void>((resolve) => {
+        if (options?.signal?.aborted) {
+          resolveCancelled?.();
+          resolve();
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => {
+          resolveCancelled?.();
+          resolve();
+        }, { once: true });
+      });
+      options?.signal?.throwIfAborted();
+    },
+  };
+  const server = createWebApiServer({ repository, provider });
+
+  try {
+    const baseUrl = await listen(server);
+    const created = await createWebSession(baseUrl);
+    const controller = new AbortController();
+    const response = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/messages/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "cancel this" }),
+      signal: controller.signal,
+    });
+    const readEvent = createSseEventReader(response.body!.getReader());
+    assert.equal((await readEvent()).event, "turn.started");
+    assert.equal((await readEvent()).event, "assistant.delta");
+    controller.abort();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        cancelled,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Provider did not receive cancellation.")), 3000);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+    const history = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
+      messages: Array<{ role: string }>;
+    };
+    assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
+  } finally {
+    await close(server);
+    await repository.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+async function createWebSession(baseUrl: string): Promise<{ sessionId: string }> {
+  const created = await fetch(`${baseUrl}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }).then((response) => response.json()) as { session: { id: string } };
+  return { sessionId: created.session.id };
+}
+
+function createSseEventReader(reader: ReadableStreamDefaultReader<Uint8Array>): () => Promise<{ event: string; data: unknown }> {
+  const decoder = new TextDecoder();
+  const queued: string[] = [];
+  let buffer = "";
+  return async () => {
+    while (queued.length === 0) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error("SSE stream ended before the expected event.");
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r\n\r\n|\n\n|\r\r/);
+      buffer = frames.pop() ?? "";
+      queued.push(...frames);
+    }
+    const frame = queued.shift() ?? "";
+    const lines = frame.split(/\r\n|\n|\r/);
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() ?? "message";
+    const data = lines.filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    return { event, data: JSON.parse(data) as unknown };
+  };
+}
+
 async function listen(server: ReturnType<typeof createWebApiServer>): Promise<string> {
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
@@ -169,5 +364,6 @@ async function close(server: ReturnType<typeof createWebApiServer>): Promise<voi
   if (!server.listening) return;
   await new Promise<void>((resolveClose, rejectClose) => {
     server.close((error) => error === undefined ? resolveClose() : rejectClose(error));
+    server.closeAllConnections();
   });
 }

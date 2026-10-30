@@ -17,3 +17,7 @@ export type ModelResponse =
 export interface TextGenerationProvider {
   generate(request: ModelRequest): Promise<ModelResponse>;
 }
+
+export interface StreamingTextGenerationProvider {
+  streamText(request: ModelRequest, options?: { signal?: AbortSignal }): AsyncIterable<string>;
+}

@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "./components/Icon";
 import {
   createSession,
   fetchHistory,
   fetchSessions,
-  sendMessage,
+  sendMessageStream,
   WebApiError,
   type SessionHistory,
   type SessionMessage,
@@ -14,8 +14,8 @@ import {
 
 const mobileBreakpoint = "(max-width: 760px)";
 
-type TurnStatus = "pending" | "completed" | "error";
-type PendingTurn = { sessionId: string; id: string; text: string; createdAt: string };
+type TurnStatus = "pending" | "completed" | "error" | "cancelled";
+type PendingTurn = { sessionId: string; id: string; text: string; assistantText: string; createdAt: string };
 
 function formatTime(value: string): string {
   const date = new Date(value);
@@ -35,21 +35,25 @@ function MessageItem({
   message,
   turnStatus,
   turnError,
+  streaming = false,
   compact = false,
   stepNumber,
 }: {
   message: SessionMessage;
   turnStatus?: TurnStatus | undefined;
   turnError?: string | undefined;
+  streaming?: boolean;
   compact?: boolean;
   stepNumber?: number;
 }) {
   const isUser = message.role === "user";
-  const statusIcon = turnStatus === "pending" ? "loader" : turnStatus === "error" ? "alert" : "check";
+  const statusIcon = turnStatus === "pending" ? "loader" : turnStatus === "error" || turnStatus === "cancelled" ? "alert" : "check";
   const statusLabel = turnStatus === "pending"
     ? "Генерируется ответ…"
     : turnStatus === "error"
       ? turnError ?? "Ошибка ответа"
+      : turnStatus === "cancelled"
+        ? "Генерация остановлена"
       : "Ответ получен";
 
   return (
@@ -61,7 +65,10 @@ function MessageItem({
           <strong>{isUser ? "Вы" : "smys"}</strong>
           <time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>
         </div>
-        <p>{message.content[0]?.text ?? ""}</p>
+        <p className={streaming && message.content[0]?.text.length === 0 ? "streaming-placeholder" : undefined}>
+          {message.content[0]?.text || (streaming ? "Генерируется ответ…" : "")}
+          {streaming && message.content[0]?.text.length > 0 && <span className="streaming-cursor" aria-hidden="true">▍</span>}
+        </p>
         {isUser && turnStatus && (
           <div className={`turn-status turn-${turnStatus}`} role={turnStatus === "error" ? "alert" : "status"}>
             <Icon name={statusIcon} size={12} />
@@ -75,14 +82,25 @@ function MessageItem({
 }
 
 function appendPendingMessage(messages: SessionMessage[], pending: PendingTurn): SessionMessage[] {
-  return [...messages, {
-    id: pending.id,
-    sessionId: pending.sessionId,
-    sequence: messages.length + 1,
-    role: "user",
-    content: [{ type: "text", text: pending.text }],
-    createdAt: pending.createdAt,
-  }];
+  return [
+    ...messages,
+    {
+      id: pending.id,
+      sessionId: pending.sessionId,
+      sequence: messages.length + 1,
+      role: "user",
+      content: [{ type: "text", text: pending.text }],
+      createdAt: pending.createdAt,
+    },
+    {
+      id: `${pending.id}-assistant`,
+      sessionId: pending.sessionId,
+      sequence: messages.length + 2,
+      role: "assistant",
+      content: [{ type: "text", text: pending.assistantText }],
+      createdAt: pending.createdAt,
+    },
+  ];
 }
 
 function ChatTimeline({
@@ -90,11 +108,13 @@ function ChatTimeline({
   history,
   pending,
   failedTurns,
+  stoppedTurns,
 }: {
   session: SessionSummary;
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
   failedTurns: ReadonlyMap<string, string>;
+  stoppedTurns: ReadonlySet<string>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === session.id ? appendPendingMessage(messages, pending) : messages;
@@ -111,6 +131,8 @@ function ChatTimeline({
             ? "pending"
             : next?.role === "assistant"
               ? "completed"
+              : stoppedTurns.has(message.id)
+                ? "cancelled"
               : failedTurns.has(message.id)
                 ? "error"
                 : undefined;
@@ -120,6 +142,7 @@ function ChatTimeline({
             message={message}
             turnStatus={status}
             turnError={failedTurns.get(message.id)}
+            streaming={message.id === `${pending?.id}-assistant`}
           />
         );
       })}
@@ -135,11 +158,13 @@ function Trajectory({
   pending,
   sessionId,
   failedTurns,
+  stoppedTurns,
 }: {
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
   sessionId: string;
   failedTurns: ReadonlyMap<string, string>;
+  stoppedTurns: ReadonlySet<string>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === sessionId ? appendPendingMessage(messages, pending) : messages;
@@ -164,6 +189,8 @@ function Trajectory({
                 ? "pending"
                 : next?.role === "assistant"
                   ? "completed"
+                  : stoppedTurns.has(message.id)
+                    ? "cancelled"
                   : failedTurns.has(message.id)
                     ? "error"
                     : undefined;
@@ -175,6 +202,7 @@ function Trajectory({
                   stepNumber={index + 1}
                   turnStatus={status}
                   turnError={failedTurns.get(message.id)}
+                  streaming={message.id === `${pending?.id}-assistant`}
                 />
               </div>
             );
@@ -286,11 +314,13 @@ function Composer({
   sending,
   error,
   onSend,
+  onCancel,
 }: {
   disabled: boolean;
   sending: boolean;
   error: string;
   onSend: (text: string) => Promise<void>;
+  onCancel: () => void;
 }) {
   const [text, setText] = useState("");
 
@@ -322,9 +352,11 @@ function Composer({
           <span className="composer-note">Enter — отправить · Shift+Enter — новая строка</span>
           <div className="composer-controls">
             <span className="composer-model">Локальная модель</span>
-            <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={disabled || sending || text.trim().length === 0}>
-              <Icon name={sending ? "loader" : "send"} size={15} />
-            </button>
+            {sending
+              ? <button className="stop-button" type="button" onClick={onCancel}>Остановить</button>
+              : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={disabled || text.trim().length === 0}>
+                <Icon name="send" size={15} />
+              </button>}
           </div>
         </div>
       </form>
@@ -343,10 +375,12 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia(mobileBreakpoint).matches);
   const [pending, setPending] = useState<PendingTurn | null>(null);
   const [failedTurns, setFailedTurns] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const [stoppedTurns, setStoppedTurns] = useState<ReadonlySet<string>>(() => new Set());
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const streamController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -430,12 +464,26 @@ export function App() {
   const submitMessage = async (text: string) => {
     if (!activeSessionId || sending) return;
     const sessionId = activeSessionId;
+    const previousMessageCount = historyBySession[sessionId]?.messages.length ?? 0;
     const optimisticId = `pending-${crypto.randomUUID()}`;
-    setPending({ sessionId, id: optimisticId, text, createdAt: new Date().toISOString() });
+    const controller = new AbortController();
+    streamController.current = controller;
+    setPending({ sessionId, id: optimisticId, text, assistantText: "", createdAt: new Date().toISOString() });
     setSending(true);
     setError("");
     try {
-      const turn = await sendMessage(sessionId, text);
+      const turn = await sendMessageStream(sessionId, text, {
+        onStarted: (_runId, userMessage) => {
+          setPending((current) => current?.sessionId === sessionId
+            ? { ...current, id: userMessage.id }
+            : current);
+        },
+        onTextDelta: (delta) => {
+          setPending((current) => current?.sessionId === sessionId
+            ? { ...current, assistantText: current.assistantText + delta }
+            : current);
+        },
+      }, controller.signal);
       setHistoryBySession((current) => {
         const previous = current[sessionId] ?? { session: { id: sessionId, createdAt: turn.userMessage.createdAt }, messages: [] };
         const existing = new Set(previous.messages.map((message) => message.id));
@@ -456,12 +504,22 @@ export function App() {
         next.delete(turn.userMessage.id);
         return next;
       });
+      setStoppedTurns((current) => {
+        if (!current.has(turn.userMessage.id)) return current;
+        const next = new Set(current);
+        next.delete(turn.userMessage.id);
+        return next;
+      });
       setPending(null);
       setSessions(await fetchSessions());
     } catch (cause) {
       const message = errorMessage(cause);
       if (cause instanceof WebApiError && cause.turnId) {
-        setFailedTurns((current) => new Map(current).set(cause.turnId!, message));
+        if (cause.code === "ABORTED") {
+          setStoppedTurns((current) => new Set(current).add(cause.turnId!));
+        } else {
+          setFailedTurns((current) => new Map(current).set(cause.turnId!, message));
+        }
         try {
           const history = await fetchHistory(sessionId);
           setHistoryBySession((current) => ({ ...current, [sessionId]: history }));
@@ -471,13 +529,36 @@ export function App() {
           setError(message);
         }
       } else {
-        setError(message);
+        if (cause instanceof WebApiError && cause.code === "ABORTED") {
+          try {
+            const history = await fetchHistory(sessionId);
+            setHistoryBySession((current) => ({ ...current, [sessionId]: history }));
+            const newUserMessage = history.messages.slice(previousMessageCount).find((entry) =>
+              entry.role === "user" && entry.content[0]?.text === text,
+            );
+            if (newUserMessage !== undefined) {
+              setStoppedTurns((current) => new Set(current).add(newUserMessage.id));
+              setError("");
+              setSessions(await fetchSessions());
+            } else {
+              setError(message);
+            }
+          } catch {
+            setError(message);
+          }
+          setPending(null);
+        } else {
+          setError(message);
+        }
       }
     } finally {
+      if (streamController.current === controller) streamController.current = null;
       setPending(null);
       setSending(false);
     }
   };
+
+  const cancelCurrentTurn = () => streamController.current?.abort();
 
   const className = `app-shell ${sidebarOpen ? "sidebar-open" : "sidebar-closed"}${isMobile ? " app-mobile" : ""}`;
 
@@ -531,12 +612,12 @@ export function App() {
             ? <div className="empty-state"><Icon name="loader" size={18} />Загружаются сессии…</div>
             : selected
               ? activeTab === "chat"
-                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} failedTurns={failedTurns} />
-                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} failedTurns={failedTurns} />
+                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} failedTurns={failedTurns} stoppedTurns={stoppedTurns} />
+                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} failedTurns={failedTurns} stoppedTurns={stoppedTurns} />
               : <div className="empty-state"><Icon name="chat" size={20} /><strong>Начните новый диалог</strong><span>Создайте сессию, чтобы отправить запрос агенту.</span><button type="button" onClick={() => { void createNewSession(); }}>Создать чат</button></div>}
         </section>
 
-        <Composer disabled={!selected} sending={sending} error={error} onSend={submitMessage} />
+        <Composer disabled={!selected} sending={sending} error={error} onSend={submitMessage} onCancel={cancelCurrentTurn} />
       </main>
     </div>
   );
