@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; end-to-end text streaming — в ADR-0010. Agent events, record/replay и сохранённая trajectory остаются будущими сценариями.
+**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; end-to-end text streaming — в ADR-0010; внутренний контракт событий Runtime/Application — в ADR-0011. HTTP-передача событий, record/replay и сохранённая trajectory остаются будущими сценариями.
 
 ## Принципы проектирования
 
@@ -22,7 +22,7 @@ CLI — ранний headless-вход для ручного запуска, с�
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
-Agent event streaming, сохранённая trajectory, projects и расширение схемы хранения остаются будущими задачами. Потоковый текст Web описан в отдельном HTTP-контракте ниже; это не журнал событий agent loop.
+Runtime/Application callback для событий хода реализован, но HTTP-передача agent events, сохранённая trajectory, projects и расширение схемы хранения остаются будущими задачами. Потоковый текст Web описан в отдельном HTTP-контракте ниже; он использует существующий SSE-контракт.
 
 ### Сигнатуры реализованных use cases
 
@@ -54,7 +54,24 @@ interface SessionRepository {
 interface AgentExecutionOptions {
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
+  onEvent?: AgentEventHandler;
 }
+
+type AgentRuntimeEvent =
+  | { type: "model.started"; callIndex: number }
+  | { type: "model.completed"; callIndex: number }
+  | { type: "reasoning.completed"; callIndex: number; text: string }
+  | { type: "tool.requested"; callId: string; name: string; arguments: unknown }
+  | { type: "tool.started"; callId: string; name: string }
+  | { type: "tool.completed"; callId: string; result: string }
+  | { type: "assistant.delta"; text: string };
+
+type AgentEvent = AgentRuntimeEvent
+  | { type: "turn.started"; runId: string; userMessage: UserMessage }
+  | { type: "turn.completed"; runId: string; assistantMessage: AssistantMessage }
+  | { type: "turn.failed"; runId: string; code: string };
+
+type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 
 interface TextGenerationProvider {
   generate(request: ModelRequest): Promise<ModelResponse>;
@@ -72,6 +89,8 @@ interface AgentTurnStreamHandlers {
 ```
 
 `listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Вызов получает или генерирует `runId`; это идентификатор хода без сохранённого execution trace. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+
+Необязательный `onEvent` получает события последовательно. Runtime отправляет `model.started`, `model.completed`, непустые `reasoning.completed`, `tool.requested`, `tool.started` и `tool.completed`; потоковый Runtime также отправляет `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с сохранением: `turn.started` идёт после записи user message, `turn.completed` — после записи assistant message, `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Callback не сохраняет события и не меняет HTTP-контракт Web.
 
 ### Local Web HTTP API
 

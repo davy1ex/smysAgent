@@ -1,9 +1,10 @@
 import type { AssistantMessage, MessageId, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
-import type { AgentTool, ToolPermissionPolicy } from "../core/agent";
+import type { AgentEventHandler, AgentTool, ToolPermissionPolicy } from "../core/agent";
 
 export interface AgentExecutionOptions {
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
+  onEvent?: AgentEventHandler;
 }
 
 export interface UserMessageDraft {

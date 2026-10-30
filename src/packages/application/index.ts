@@ -4,6 +4,9 @@ export type { AgentExecutionOptions, AssistantMessageDraft, SessionRepository, U
 export { createSession, getHistory, listSessions, runAgentTurn, runAgentTurnStreaming, sendMessage } from "./use-cases";
 export type { AgentTurnStreamHandlers, SessionSummary } from "./use-cases";
 export type {
+  AgentEvent,
+  AgentEventHandler,
+  AgentRuntimeEvent,
   AgentTurnResult,
   AgentRuntimeErrorCode,
   AgentTool,

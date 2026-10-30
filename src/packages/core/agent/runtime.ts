@@ -1,4 +1,5 @@
 import type { Message, SessionId } from "../session";
+import type { AgentEventHandler, AgentRuntimeEvent } from "./events";
 import { AgentRuntimeError } from "./errors";
 import type {
   ModelMessage,
@@ -17,6 +18,7 @@ export interface AgentRuntimeOptions {
   sessionId: SessionId;
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
+  onEvent?: AgentEventHandler;
 }
 
 export interface AgentTextStreamOptions extends AgentRuntimeOptions {
@@ -39,23 +41,35 @@ export async function runAgentTurn(
   let toolExecutions = 0;
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
+    const callIndex = modelCall + 1;
+    await emitEvent(options.onEvent, { type: "model.started", callIndex });
     const response = await provider.generate({
       messages: [...conversation],
       tools: toolExecutions < MAX_TOOL_EXECUTIONS ? tools.map((tool) => tool.definition) : [],
     });
 
-    collectReasoning(response, reasoningParts);
+    await collectReasoning(response, reasoningParts, callIndex, options.onEvent);
     if (response.kind === "final") {
-      return createTurnResult(response, reasoningParts);
+      const result = createTurnResult(response, reasoningParts);
+      await emitEvent(options.onEvent, { type: "model.completed", callIndex });
+      return result;
     }
     if (response.kind !== "tool-call") {
       throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");
     }
+
+    validateToolCallIdentity(response);
+    await emitEvent(options.onEvent, { type: "model.completed", callIndex });
+    await emitEvent(options.onEvent, {
+      type: "tool.requested",
+      callId: response.callId,
+      name: response.name,
+      arguments: response.arguments,
+    });
     if (modelCall + 1 >= MAX_MODEL_CALLS || toolExecutions >= MAX_TOOL_EXECUTIONS) {
       throw new AgentRuntimeError("LOOP_LIMIT", "The agent turn exceeded its tool-call limit.");
     }
 
-    validateToolCallIdentity(response);
     const toolCall: ToolCall = {
       callId: response.callId,
       name: response.name,
@@ -82,6 +96,7 @@ export async function streamAgentTurn(
 
   const conversation = createModelConversation(messages);
   const textParts: string[] = [];
+  await emitEvent(options.onEvent, { type: "model.started", callIndex: 1 });
   for await (const delta of provider.streamText({ messages: conversation, tools: [] }, {
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   })) {
@@ -92,6 +107,7 @@ export async function streamAgentTurn(
     if (delta.length === 0) continue;
     textParts.push(delta);
     await options.onTextDelta(delta);
+    await emitEvent(options.onEvent, { type: "assistant.delta", text: delta });
   }
   options.signal?.throwIfAborted();
 
@@ -99,6 +115,7 @@ export async function streamAgentTurn(
   if (text.length === 0) {
     throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an empty response.");
   }
+  await emitEvent(options.onEvent, { type: "model.completed", callIndex: 1 });
   return { text };
 }
 
@@ -131,7 +148,12 @@ function createModelConversation(messages: readonly Message[]): ModelMessage[] {
   });
 }
 
-function collectReasoning(response: ModelResponse, reasoningParts: string[]): void {
+async function collectReasoning(
+  response: ModelResponse,
+  reasoningParts: string[],
+  callIndex: number,
+  onEvent: AgentEventHandler | undefined,
+): Promise<void> {
   if (typeof response !== "object" || response === null) {
     throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");
   }
@@ -141,6 +163,11 @@ function collectReasoning(response: ModelResponse, reasoningParts: string[]): vo
     }
     if (response.reasoning.length > 0) {
       reasoningParts.push(response.reasoning);
+      await emitEvent(onEvent, {
+        type: "reasoning.completed",
+        callIndex,
+        text: response.reasoning,
+      });
     }
   }
 }
@@ -201,6 +228,7 @@ async function executeToolCall(
     throw new AgentRuntimeError("PERMISSION_DENIED", "The tool call was denied.");
   }
 
+  await emitEvent(options.onEvent, { type: "tool.started", callId: response.callId, name: response.name });
   let result: string;
   try {
     result = await tool.execute(response.arguments, { sessionId: options.sessionId });
@@ -210,7 +238,15 @@ async function executeToolCall(
   if (typeof result !== "string") {
     throw new AgentRuntimeError("TOOL_EXECUTION_FAILED", "Tool execution returned an invalid result.");
   }
+  await emitEvent(options.onEvent, { type: "tool.completed", callId: response.callId, result });
   return result;
+}
+
+async function emitEvent(
+  onEvent: AgentEventHandler | undefined,
+  event: AgentRuntimeEvent,
+): Promise<void> {
+  await onEvent?.(event);
 }
 
 function appendToolExchange(conversation: ModelMessage[], toolCall: ToolCall, result: string): void {

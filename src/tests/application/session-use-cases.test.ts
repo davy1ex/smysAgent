@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   AgentRuntimeError,
   runAgentTurn as runCoreAgentTurn,
+  type AgentEvent,
   type AgentTool,
   type ToolPermissionPolicy,
 } from "../../packages/core/agent";
@@ -146,6 +147,7 @@ test("application streaming turn forwards deltas and persists their final text o
   const repository = new MemorySessionRepository();
   const session = await createSession(repository);
   const chunks: string[] = [];
+  const events: AgentEvent[] = [];
   const provider = {
     async generate() {
       throw new Error("Streaming path should not call generate().");
@@ -164,10 +166,19 @@ test("application streaming turn forwards deltas and persists their final text o
       onStarted(_runId, userMessage) { startedUser = userMessage; },
       onTextDelta(delta) { chunks.push(delta); },
     },
+    { onEvent(event) { events.push(event); } },
   );
   const history = await getHistory(repository, session.id);
 
   assert.deepEqual(chunks, ["streamed ", "reply"]);
+  assert.deepEqual(events.map((event) => event.type), [
+    "turn.started",
+    "model.started",
+    "assistant.delta",
+    "assistant.delta",
+    "model.completed",
+    "turn.completed",
+  ]);
   assert.equal(startedUser?.id, turn.userMessage.id);
   assert.equal(turn.assistantMessage.content[0]?.text, "streamed reply");
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
@@ -264,6 +275,117 @@ test("application API executes one permitted tool and persists only the final an
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0].text]), [
     ["user", "use the test tool"],
     ["assistant", "The tool returned: from tool"],
+  ]);
+});
+
+test("application emits ordered per-call reasoning and tool events around persistence", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const events: AgentEvent[] = [];
+  const provider = new FakeProvider([
+    {
+      kind: "tool-call",
+      callId: "call-1",
+      name: "test.echo",
+      arguments: { text: "from tool" },
+      reasoning: "Prepare the tool call.",
+    },
+    { kind: "final", text: "The tool returned: from tool", reasoning: "Use the tool result." },
+  ]);
+
+  const turn = await runAgentTurn(
+    repository,
+    provider,
+    { sessionId: session.id, text: "use the test tool", runId: "run-1" },
+    {
+      tools: [createTestTool()],
+      permissionPolicy: { async authorize() { return "allow"; } },
+      async onEvent(event) {
+        events.push(event);
+        if (event.type === "turn.completed") {
+          const history = await getHistory(repository, session.id);
+          assert.equal(history.messages.at(-1)?.role, "assistant");
+        }
+      },
+    },
+  );
+
+  assert.equal(turn.reasoning, "Prepare the tool call.\n\nUse the tool result.");
+  assert.deepEqual(events, [
+    { type: "turn.started", runId: "run-1", userMessage: turn.userMessage },
+    { type: "model.started", callIndex: 1 },
+    { type: "reasoning.completed", callIndex: 1, text: "Prepare the tool call." },
+    { type: "model.completed", callIndex: 1 },
+    {
+      type: "tool.requested",
+      callId: "call-1",
+      name: "test.echo",
+      arguments: { text: "from tool" },
+    },
+    { type: "tool.started", callId: "call-1", name: "test.echo" },
+    { type: "tool.completed", callId: "call-1", result: "from tool" },
+    { type: "model.started", callIndex: 2 },
+    { type: "reasoning.completed", callIndex: 2, text: "Use the tool result." },
+    { type: "model.completed", callIndex: 2 },
+    { type: "turn.completed", runId: "run-1", assistantMessage: turn.assistantMessage },
+  ]);
+});
+
+test("application reports a denied tool request without claiming execution", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const events: AgentEvent[] = [];
+
+  await assert.rejects(
+    runAgentTurn(
+      repository,
+      new FakeProvider([{
+        kind: "tool-call",
+        callId: "call-denied",
+        name: "test.echo",
+        arguments: { text: "x" },
+      }]),
+      { sessionId: session.id, text: "deny the tool", runId: "run-denied" },
+      {
+        tools: [createTestTool()],
+        permissionPolicy: { async authorize() { return "deny"; } },
+        onEvent(event) { events.push(event); },
+      },
+    ),
+    (error: unknown) => error instanceof AgentRuntimeError && error.code === "PERMISSION_DENIED",
+  );
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "turn.started",
+    "model.started",
+    "model.completed",
+    "tool.requested",
+    "turn.failed",
+  ]);
+  const failureEvent = events.at(-1);
+  assert.equal(failureEvent?.type, "turn.failed");
+  if (failureEvent?.type === "turn.failed") {
+    assert.equal(failureEvent.code, "PERMISSION_DENIED");
+  }
+});
+
+test("application omits reasoning events when the provider supplies no reasoning", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const events: AgentEvent[] = [];
+
+  await runAgentTurn(
+    repository,
+    new FakeProvider([{ kind: "final", text: "plain answer" }]),
+    { sessionId: session.id, text: "no reasoning" },
+    { onEvent(event) { events.push(event); } },
+  );
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "turn.started",
+    "model.started",
+    "model.completed",
+    "turn.completed",
   ]);
 });
 

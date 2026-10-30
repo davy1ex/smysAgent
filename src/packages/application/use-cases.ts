@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   runAgentTurn as generateAgentReply,
   streamAgentTurn as generateAgentReplyStream,
+  AgentRuntimeError,
   type StreamingTextGenerationProvider,
   type TextGenerationProvider,
 } from "../core/agent";
@@ -74,25 +75,38 @@ export async function runAgentTurn(
   if (runId.length === 0) {
     throw new InvalidArgumentError("runId must not be empty.");
   }
-  const userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
-  const history = await getHistory(repository, input.sessionId);
-  const result = await generateAgentReply(history.messages, provider, {
-    sessionId: input.sessionId,
-    ...agentOptions,
-  });
-  const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
-    id: randomUUID(),
-    createdAt: new Date().toISOString(),
-    text: result.text,
-  });
-  if (assistantMessage === null) {
-    throw new SessionNotFoundError(input.sessionId);
+  let userMessage: UserMessage;
+  let assistantMessage: AssistantMessage;
+  let reasoning: string | undefined;
+  try {
+    userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
+    await agentOptions.onEvent?.({ type: "turn.started", runId, userMessage });
+    const history = await getHistory(repository, input.sessionId);
+    const result = await generateAgentReply(history.messages, provider, {
+      sessionId: input.sessionId,
+      ...agentOptions,
+    });
+    reasoning = result.reasoning;
+    const savedAssistantMessage = await repository.appendAssistantMessage(input.sessionId, {
+      id: randomUUID(),
+      createdAt: new Date().toISOString(),
+      text: result.text,
+    });
+    if (savedAssistantMessage === null) {
+      throw new SessionNotFoundError(input.sessionId);
+    }
+    assistantMessage = savedAssistantMessage;
+  } catch (error) {
+    await emitTurnFailure(agentOptions.onEvent, runId, error);
+    throw error;
   }
+
+  await agentOptions.onEvent?.({ type: "turn.completed", runId, assistantMessage });
   return {
     runId,
     userMessage,
     assistantMessage,
-    ...(result.reasoning === undefined ? {} : { reasoning: result.reasoning }),
+    ...(reasoning === undefined ? {} : { reasoning }),
   };
 }
 
@@ -117,26 +131,56 @@ export async function runAgentTurnStreaming(
     throw new InvalidArgumentError("runId must not be empty.");
   }
   handlers.signal?.throwIfAborted();
-  const userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
-  await handlers.onStarted(runId, userMessage);
-  handlers.signal?.throwIfAborted();
-  const history = await getHistory(repository, input.sessionId);
-  const result = await generateAgentReplyStream(history.messages, provider, {
-    sessionId: input.sessionId,
-    ...agentOptions,
-    onTextDelta: handlers.onTextDelta,
-    ...(handlers.signal === undefined ? {} : { signal: handlers.signal }),
-  });
-  handlers.signal?.throwIfAborted();
-  const assistantMessage = await repository.appendAssistantMessage(input.sessionId, {
-    id: randomUUID(),
-    createdAt: new Date().toISOString(),
-    text: result.text,
-  });
-  if (assistantMessage === null) {
-    throw new SessionNotFoundError(input.sessionId);
+  let userMessage: UserMessage;
+  let assistantMessage: AssistantMessage;
+  try {
+    userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
+    await agentOptions.onEvent?.({ type: "turn.started", runId, userMessage });
+    await handlers.onStarted(runId, userMessage);
+    handlers.signal?.throwIfAborted();
+    const history = await getHistory(repository, input.sessionId);
+    const result = await generateAgentReplyStream(history.messages, provider, {
+      sessionId: input.sessionId,
+      ...agentOptions,
+      onTextDelta: handlers.onTextDelta,
+      ...(handlers.signal === undefined ? {} : { signal: handlers.signal }),
+    });
+    handlers.signal?.throwIfAborted();
+    const savedAssistantMessage = await repository.appendAssistantMessage(input.sessionId, {
+      id: randomUUID(),
+      createdAt: new Date().toISOString(),
+      text: result.text,
+    });
+    if (savedAssistantMessage === null) {
+      throw new SessionNotFoundError(input.sessionId);
+    }
+    assistantMessage = savedAssistantMessage;
+  } catch (error) {
+    await emitTurnFailure(agentOptions.onEvent, runId, error);
+    throw error;
   }
+
+  await agentOptions.onEvent?.({ type: "turn.completed", runId, assistantMessage });
   return { runId, userMessage, assistantMessage };
+}
+
+async function emitTurnFailure(
+  onEvent: AgentExecutionOptions["onEvent"],
+  runId: string,
+  error: unknown,
+): Promise<void> {
+  const code = error instanceof AgentRuntimeError
+    ? error.code
+    : error instanceof InvalidArgumentError
+      ? "INVALID_ARGUMENT"
+      : error instanceof SessionNotFoundError
+        ? "SESSION_NOT_FOUND"
+        : "TURN_FAILED";
+  try {
+    await onEvent?.({ type: "turn.failed", runId, code });
+  } catch {
+    // Preserve the original turn failure if an event consumer also fails.
+  }
 }
 
 export async function getHistory(

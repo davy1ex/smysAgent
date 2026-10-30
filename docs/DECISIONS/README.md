@@ -18,6 +18,7 @@ AI может исследовать варианты, подготовить п
 - [ADR-0008: Shell и компактная лента агента](ADR-0008-ui-shell-compact-timeline.md) — локальная навигация по демо-сессиям, вкладки Chat/Trajectory и три состояния tool call без изменения backend-контрактов.
 - [ADR-0009: Локальный HTTP host для Web](ADR-0009-local-web-host.md) — браузер вызывает Application API через loopback Node host; provider и JSON store остаются на стороне host.
 - [ADR-0010: End-to-end text streaming](ADR-0010-end-to-end-text-streaming.md) — отдельный SSE endpoint передаёт текстовые чанки Web-клиенту; финальный ответ сохраняется после чистого завершения потока.
+- [ADR-0011: Внутренний контракт событий хода агента](ADR-0011-agent-event-contract.md) — Core сообщает model/tool/reasoning события, Application сообщает lifecycle после сохранения сообщений; события пока не сохраняются и не передаются Web host.
 
 ## Шаблон
 
