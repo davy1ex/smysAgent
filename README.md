@@ -55,7 +55,19 @@ npm run --silent cli -- history get --json --session-id <SESSION_ID> > chat.json
 
 Это выгрузка списка сообщений одной сессии, без run traces; файл нельзя импортировать обратно через CLI. Для ручной резервной копии чатов и SQLite-конфигурации остановите Web Host и CLI-процессы и скопируйте `store.sqlite` из каталога данных. API keys в эту копию не входят: они находятся в Keychain.
 
-CLI может использовать сохранённый выбор модели или передать одноразовый `--model-config-id`; прежние env-настройки остаются fallback. Форматы CLI и хранения описаны в [контрактах](docs/CONTRACTS.md).
+### CLI
+
+CLI — headless интерфейс к тому же Application API и SQLite-хранилищу, рассчитанный на терминал, скрипты и автоматизацию. Это не полноценная замена Web UI: CLI не управляет каталогом providers/models, не даёт выбирать сессии из списка и не показывает сохранённую траекторию run. Provider и модели настраиваются в Web; CLI использует сохранённый выбор либо принимает одноразовый `--model-config-id`.
+
+Основные команды: создать сессию, добавить пользовательское сообщение без запуска модели, выполнить ход и прочитать сообщения сессии. Пример:
+
+```sh
+npm run --silent cli -- session create --json --initial-message "Привет"
+npm run --silent cli -- agent run --json --session-id <SESSION_ID> --text "Продолжи разговор"
+npm run --silent cli -- history get --json --session-id <SESSION_ID>
+```
+
+Ответы поддерживают обычный текст или `--json`; ход можно выводить потоково через `--stream`, а для обработки событий скриптом — `--stream --output ndjson`. `history get` возвращает сообщения, но не run traces. Доступен встроенный `demo.add`, только если явно подключить и разрешить его флагами `--tool demo.add --allow-tool demo.add`. Старые `--provider fake|lm-studio` и env-настройки остаются fallback. Полные команды, JSON-контракт и коды выхода — в [контрактах](docs/CONTRACTS.md).
 
 ## Документация
 
