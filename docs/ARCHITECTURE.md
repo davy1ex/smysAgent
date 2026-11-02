@@ -1,16 +1,16 @@
 # Architecture
 
-**Статус:** документ разделяет текущую реализацию и целевые направления. Внутренний application API и headless-first вход утверждены в ADR-0001. Целевые схемы ниже не означают, что описанные модули, пути или контракты уже реализованы.
+**Статус:** документ разделяет текущую реализацию и целевые направления. Внутренний application API и headless-first вход утверждены в ADR-0001; единое исполнение хода — в ADR-0012. Целевые схемы ниже не означают, что описанные модули, пути или контракты уже реализованы.
 
 ## Текущая реализация
 
-В репозитории реализованы два host: CLI напрямую вызывает application use cases, а браузерный Web-клиент обращается к тем же use cases через локальный HTTP host. Application сохраняет пользовательское сообщение, core получает ответ provider, application сохраняет финальный ответ, а JSON-хранилище позволяет восстановить историю после перезапуска. Web может читать текстовые чанки через SSE; финальный ответ сохраняется один раз после корректного окончания генерации. Core/application также реализуют ограниченный цикл с одним переданным инструментом и проверкой разрешений. Runtime передаёт типизированные события модели и инструментов в Application callback; Application сообщает lifecycle после записи сообщений. Эти события временные и пока не входят в HTTP-контракт. CLI по умолчанию не передаёт tools; `demo.add` подключается явными флагами.
+В репозитории реализованы два host: CLI и Web вызывают один Application use case `executeTurn()` через общий Core loop. Application сохраняет пользовательское сообщение, Core получает ответ provider и при необходимости передаёт текстовые дельты, Application сохраняет финальный ответ, а JSON-хранилище позволяет восстановить историю после перезапуска. Один цикл поддерживает tool call, reasoning, streaming и отмену. Web SSE передаёт runtime/lifecycle events; CLI поддерживает обычный вывод, `--json`, text streaming и NDJSON. Web подключает `demo.add` только по явному одноходовому разрешению; CLI требует `--tool` и `--allow-tool`.
 
 ```text
-src/apps/cli/{demo-tools,main,smoke-lm-studio}.ts
+src/apps/cli/{main,smoke-lm-studio}.ts
 src/apps/web-host/{main,server}.ts    # локальный HTTP host поверх Application API
 src/apps/web/                         # React/Vite клиент с HTTP adapter
-src/packages/application/{errors,index,ports,use-cases}.ts
+src/packages/application/{demo-tools,errors,index,ports,use-cases}.ts
 src/packages/core/agent/{errors,index,model,runtime,tool}.ts
 src/packages/core/session.ts
 src/packages/providers/{fake-provider,lm-studio-provider}.ts
@@ -19,7 +19,7 @@ src/tests/{application,cli,providers,storage,web-host}/
 docs/
 ```
 
-`src/apps/web` показывает реальные сессии и сообщения из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает Application use cases и выбирает Fake или LM Studio. Проекты и agent event streaming пока не реализованы: группа сессий называется «Без проекта», а вкладка истории показывает только сохранённые сообщения. Текущий текстовый поток является временным UI-состоянием; reasoning и tool calls не выдаются за сохранённую trajectory. Web host сериализует изменяющие HTTP-запросы в одном процессе; CLI не должен одновременно записывать тот же JSON store. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
+`src/apps/web` показывает реальные сессии и сообщения из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает `executeTurn()` и выбирает Fake или LM Studio. SSE runtime events и текстовый поток являются временным состоянием; reasoning и tool calls не записываются в историю. Web UI предлагает явный checkbox для grant `demo.add` на один ход. Проекты пока не реализованы: группа сессий называется «Без проекта», а вкладка истории показывает сохранённые сообщения и reasoning текущего браузерного сеанса. Web host сериализует изменяющие HTTP-запросы в одном процессе; CLI не должен одновременно записывать тот же JSON store. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
 
 ## Целевая модель
 
@@ -97,10 +97,11 @@ flowchart TB
 
 ## Application API и входы: текущее и будущее
 
-Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `runAgentTurn`, `runAgentTurnStreaming` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. Потоковый use case принимает текстовые чанки через callback, поддерживает отмену и не сохраняет частичный ответ. `createProject` и `replaySession` не реализованы.
+Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `executeTurn` и `getHistory`. Это внутренняя граница use cases; тесты могут вызывать её напрямую с fake provider и тестовым хранилищем. `executeTurn` принимает необязательный `AbortSignal` и callback событий/текстовых дельт, сохраняет только завершённый ответ и оставляет совместимые делегаты `runAgentTurn` и `runAgentTurnStreaming`. `createProject` и `replaySession` не реализованы.
 
-- CLI — headless host для создания сессий, отправки сообщений и чтения истории. Он вызывает application API, поддерживает JSON-вывод и стабильные коды завершения.
-- Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и `POST /api/sessions/:id/messages/stream`. Последний использует SSE и `runAgentTurnStreaming`; отмена запроса передаётся provider.
+- CLI — headless host для создания сессий, отправки сообщений и чтения истории. Он вызывает `executeTurn`, поддерживает прежний JSON-контракт, text streaming, NDJSON и стабильные коды завершения, включая отмену по SIGINT.
+- Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и `POST /api/sessions/:id/messages/stream`. Оба изменяющих маршрута используют `executeTurn`; SSE отображает общий список событий и передаёт отмену provider.
+- В Web тело хода может явно включить `allowTools: ["demo.add"]`. Пустой или отсутствующий grant оставляет runtime без инструментов; UI сбрасывает checkbox после отправки.
 - Web host по умолчанию использует Fake provider; LM Studio настраивается переменными окружения. Host слушает `127.0.0.1`, а Vite проксирует браузерные API-запросы.
 - Worker отложен до фонового сценария. Он должен вызывать те же use cases, а не реализовывать собственный цикл агента.
 - Сейчас есть unit/integration-тесты application, storage и providers, а также CLI process-тесты. CLI проверяет реальный процесс и постоянное хранилище между запусками.
@@ -122,7 +123,7 @@ application сохраняет user message
 
 В реализованном срезе за ход можно передать максимум один инструмент. Runtime делает максимум два вызова модели и один вызов инструмента. Он проверяет имя и аргументы, затем запрашивает разрешение; выполнение происходит только при явном `allow`. Неизвестный инструмент, неверные аргументы, отказ, сбой инструмента или provider и превышение лимита завершают ход без финального сообщения ассистента.
 
-Application API сохраняет сообщение пользователя, передаёт историю runtime и сохраняет только финальный текст ассистента. Reasoning возвращается отдельно как временный результат хода, показывается CLI и не сохраняется в истории. Через `AgentEvent` Runtime сообщает границы каждого вызова модели, reasoning по вызовам, запрос инструмента, начало разрешённого исполнения и его результат. Application сообщает `turn.started` после записи user message, `turn.completed` после записи assistant message и `turn.failed` при ошибке. Tool call и результат по-прежнему живут во временном контексте модели. При ошибке остаётся пользовательское сообщение без ответа ассистента. Fake provider позволяет детерминированно проверить цепочку «tool call → результат → финальный ответ». LM Studio преобразует один OpenAI-compatible вызов функции и промежуточную пару assistant/tool. CLI передаёт пустой список tools по умолчанию; с `--tool demo.add` добавляет только встроенный инструмент, а исполнение разрешает только с отдельным `--allow-tool demo.add`.
+Application `executeTurn` сохраняет user message, передаёт историю единому runtime и сохраняет только финальный текст ассистента. Reasoning возвращается отдельно как временный результат хода; Web и CLI могут отобразить его, но store и история его не содержат. Через `AgentEvent` Runtime сообщает границы model calls, reasoning, запрос инструмента, начало разрешённого исполнения, результат инструмента и текстовые дельты. Application сообщает `turn.started` после записи user message, `turn.completed` после записи assistant message и `turn.failed` при ошибке. Tool call и результат остаются во временном контексте модели. При ошибке или отмене остаётся пользовательское сообщение без частичного ответа ассистента. Fake provider проверяет один и тот же цикл через CLI и Web. LM Studio преобразует stream tool-call fragments и промежуточную пару assistant/tool. CLI подключает `demo.add` флагами; Web получает его только с одноразовым явным `allowTools` grant.
 
 Хранилище v2 допускает сообщения `user` и `assistant`. Валидный v1 читается без изменения файла и мигрируется при первой записи; исходник сохраняется как `store.json.v1.bak` до атомарной замены. Неизвестный и повреждённый формат отклоняется без автоматического сброса.
 

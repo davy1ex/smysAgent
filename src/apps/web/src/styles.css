@@ -214,6 +214,12 @@ button:disabled { opacity: 1; cursor: default; }
 .composer textarea { color: #d4d5d2; }
 .composer textarea:disabled { opacity: .7; }
 .composer textarea::placeholder { color: #747678; }
+.composer-tool-permission { display: flex; width: fit-content; align-items: center; gap: 6px; margin: 5px 0 2px; color: #858789; font-size: 9px; cursor: pointer; }
+.composer-tool-permission input { accent-color: #aaa; }
+.turn-activity { display: block; margin-top: 5px; color: #969895; font-size: 9px; }
+.turn-reasoning { margin-top: 6px; color: #929490; font-size: 9px; }
+.turn-reasoning summary { cursor: pointer; }
+.turn-reasoning p { margin: 5px 0; white-space: pre-wrap; }
 .composer-toolbar { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
 .composer-icon-button { display: grid; width: 25px; height: 25px; place-items: center; border: 0; border-radius: 5px; color: #858789; background: transparent; }
 .composer-controls { display: flex; align-items: center; gap: 10px; color: #77797b; font-size: 8px; }

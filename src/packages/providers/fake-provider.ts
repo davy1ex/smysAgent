@@ -1,21 +1,23 @@
 import type {
+  ModelGenerationOptions,
   ModelRequest,
   ModelResponse,
-  StreamingTextGenerationProvider,
   TextGenerationProvider,
 } from "../core/agent";
 
-export class FakeProvider implements TextGenerationProvider, StreamingTextGenerationProvider {
+export class FakeProvider implements TextGenerationProvider {
   readonly requests: ModelRequest[] = [];
   private responseIndex = 0;
 
   constructor(private readonly scriptedResponses: readonly ModelResponse[] = []) {}
 
-  async generate(request: ModelRequest): Promise<ModelResponse> {
+  async generate(request: ModelRequest, options: ModelGenerationOptions = {}): Promise<ModelResponse> {
+    options.signal?.throwIfAborted();
     this.requests.push({ messages: [...request.messages], tools: [...request.tools] });
     const scriptedResponse = this.scriptedResponses[this.responseIndex];
     if (scriptedResponse !== undefined) {
       this.responseIndex += 1;
+      await this.emitText(scriptedResponse, options);
       return scriptedResponse;
     }
     if (this.scriptedResponses.length > 0) {
@@ -26,19 +28,18 @@ export class FakeProvider implements TextGenerationProvider, StreamingTextGenera
     if (lastUserMessage === undefined || !("content" in lastUserMessage)) {
       throw new Error("The fake provider requires at least one user message.");
     }
-    return { kind: "final", text: `Fake response to: ${lastUserMessage.content}` };
+    const response = { kind: "final", text: `Fake response to: ${lastUserMessage.content}` } as const;
+    await this.emitText(response, options);
+    return response;
   }
 
-  async *streamText(request: ModelRequest, options: { signal?: AbortSignal } = {}): AsyncIterable<string> {
-    const response = await this.generate(request);
-    if (response.kind !== "final") {
-      throw new Error("The fake provider cannot stream tool calls.");
-    }
+  private async emitText(response: ModelResponse, options: ModelGenerationOptions): Promise<void> {
+    if (response.kind !== "final" || options.onTextDelta === undefined) return;
     for (let offset = 0; offset < response.text.length; offset += 8) {
       options.signal?.throwIfAborted();
       if (offset > 0) await new Promise<void>((resolve) => setTimeout(resolve, 20));
       options.signal?.throwIfAborted();
-      yield response.text.slice(offset, offset + 8);
+      await options.onTextDelta(response.text.slice(offset, offset + 8));
     }
   }
 }

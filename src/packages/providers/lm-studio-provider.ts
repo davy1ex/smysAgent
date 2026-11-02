@@ -1,8 +1,8 @@
 import type {
+  ModelGenerationOptions,
   ModelMessage,
   ModelRequest,
   ModelResponse,
-  StreamingTextGenerationProvider,
   TextGenerationProvider,
   ToolDefinition,
 } from "../core/agent";
@@ -21,14 +21,19 @@ export class LmStudioProviderError extends Error {
   }
 }
 
-export class LmStudioProvider implements TextGenerationProvider, StreamingTextGenerationProvider {
+export class LmStudioProvider implements TextGenerationProvider {
   private readonly fetcher: typeof fetch;
 
   constructor(private readonly options: LmStudioProviderOptions) {
     this.fetcher = options.fetcher ?? fetch;
   }
 
-  async generate(request: ModelRequest): Promise<ModelResponse> {
+  async generate(request: ModelRequest, options: ModelGenerationOptions = {}): Promise<ModelResponse> {
+    options.signal?.throwIfAborted();
+    if (options.onTextDelta !== undefined) {
+      return this.generateStreaming(request, options);
+    }
+
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.options.apiToken !== undefined && this.options.apiToken.length > 0) {
       headers.authorization = `Bearer ${this.options.apiToken}`;
@@ -49,8 +54,10 @@ export class LmStudioProvider implements TextGenerationProvider, StreamingTextGe
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch {
+      options.signal?.throwIfAborted();
       throw new LmStudioProviderError("Could not connect to LM Studio.");
     }
 
@@ -72,10 +79,7 @@ export class LmStudioProvider implements TextGenerationProvider, StreamingTextGe
     return modelResponse;
   }
 
-  async *streamText(request: ModelRequest, options: { signal?: AbortSignal } = {}): AsyncIterable<string> {
-    if (request.tools.length > 0) {
-      throw new LmStudioProviderError("LM Studio text streaming does not support tools.");
-    }
+  private async generateStreaming(request: ModelRequest, options: ModelGenerationOptions): Promise<ModelResponse> {
     options.signal?.throwIfAborted();
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.options.apiToken !== undefined && this.options.apiToken.length > 0) {
@@ -91,6 +95,9 @@ export class LmStudioProvider implements TextGenerationProvider, StreamingTextGe
           model: this.options.model,
           messages: request.messages.map(toLmStudioMessage),
           stream: true,
+          ...(request.tools.length > 0
+            ? { tools: request.tools.map(toLmStudioTool), tool_choice: "auto" }
+            : {}),
         }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
@@ -103,10 +110,15 @@ export class LmStudioProvider implements TextGenerationProvider, StreamingTextGe
       throw new LmStudioProviderError(`LM Studio returned HTTP ${response.status}.`);
     }
     if (response.body === null) {
-      throw new LmStudioProviderError("LM Studio returned an invalid text stream.");
+      throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
     }
 
     let receivedDone = false;
+    let callbackFailed = false;
+    let callbackFailure: unknown;
+    let text = "";
+    let reasoning = "";
+    const toolCalls = new Map<number, StreamToolCall>();
     try {
       for await (const data of readSseData(response.body, options.signal)) {
         options.signal?.throwIfAborted();
@@ -118,24 +130,82 @@ export class LmStudioProvider implements TextGenerationProvider, StreamingTextGe
         try {
           payload = JSON.parse(data) as unknown;
         } catch {
-          throw new LmStudioProviderError("LM Studio returned an invalid text stream.");
+          throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
         }
-        const delta = getTextDelta(payload);
+        const delta = getStreamDelta(payload);
         if (delta === null) {
-          throw new LmStudioProviderError("LM Studio returned an invalid text stream.");
+          throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
         }
-        if (delta.length > 0) yield delta;
+        if (delta.text.length > 0) {
+          text += delta.text;
+          try {
+            await options.onTextDelta?.(delta.text);
+          } catch (error) {
+            callbackFailed = true;
+            callbackFailure = error;
+            throw error;
+          }
+        }
+        reasoning += delta.reasoning;
+        for (const call of delta.toolCalls) {
+          const current = toolCalls.get(call.index) ?? {
+            id: "",
+            type: "",
+            name: "",
+            arguments: "",
+          };
+          current.id += call.id;
+          current.type += call.type;
+          current.name += call.name;
+          current.arguments += call.arguments;
+          toolCalls.set(call.index, current);
+        }
       }
     } catch (error) {
       options.signal?.throwIfAborted();
+      if (callbackFailed) throw callbackFailure;
       if (error instanceof LmStudioProviderError) throw error;
-      throw new LmStudioProviderError("LM Studio text stream ended unexpectedly.");
+      throw new LmStudioProviderError("LM Studio chat completion stream ended unexpectedly.");
     }
     options.signal?.throwIfAborted();
     if (!receivedDone) {
-      throw new LmStudioProviderError("LM Studio text stream ended unexpectedly.");
+      throw new LmStudioProviderError("LM Studio chat completion stream ended unexpectedly.");
     }
+    if (toolCalls.size > 1) {
+      throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+    }
+    const reasoningField = reasoning.length > 0 ? { reasoning } : {};
+    const [toolCall] = toolCalls.values();
+    if (toolCall !== undefined) {
+      if (text.length > 0 || toolCall.type !== "function" || toolCall.id.length === 0 || toolCall.name.length === 0) {
+        throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+      }
+      let argumentsValue: unknown;
+      try {
+        argumentsValue = JSON.parse(toolCall.arguments) as unknown;
+      } catch {
+        throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+      }
+      return {
+        kind: "tool-call",
+        callId: toolCall.id,
+        name: toolCall.name,
+        arguments: argumentsValue,
+        ...reasoningField,
+      };
+    }
+    if (text.length === 0) {
+      throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
+    }
+    return { kind: "final", text, ...reasoningField };
   }
+}
+
+interface StreamToolCall {
+  id: string;
+  type: string;
+  name: string;
+  arguments: string;
 }
 
 async function* readSseData(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<string> {
@@ -146,7 +216,7 @@ async function* readSseData(body: ReadableStream<Uint8Array>, signal?: AbortSign
   try {
     while (true) {
       signal?.throwIfAborted();
-      const { value, done } = await reader.read();
+      const { value, done } = await readWithSignal(reader, signal);
       if (done) {
         bodyEnded = true;
         break;
@@ -170,6 +240,31 @@ async function* readSseData(body: ReadableStream<Uint8Array>, signal?: AbortSign
   }
 }
 
+function readWithSignal(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal === undefined) return reader.read();
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      void reader.cancel(signal.reason).catch(() => undefined);
+      reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function findSseBoundary(value: string): { index: number; length: number } | null {
   const match = /\r\n\r\n|\n\n|\r\r/.exec(value);
   return match === null ? null : { index: match.index, length: match[0].length };
@@ -182,7 +277,11 @@ function parseSseData(frame: string): string | null {
   return dataLines.length === 0 ? null : dataLines.join("\n");
 }
 
-function getTextDelta(payload: unknown): string | null {
+function getStreamDelta(payload: unknown): {
+  text: string;
+  reasoning: string;
+  toolCalls: Array<{ index: number; id: string; type: string; name: string; arguments: string }>;
+} | null {
   if (typeof payload !== "object" || payload === null) return null;
   const record = payload as Record<string, unknown>;
   if ("error" in record) return null;
@@ -190,12 +289,46 @@ function getTextDelta(payload: unknown): string | null {
   if (!Array.isArray(choices) || choices.length === 0) return null;
   const firstChoice = choices[0];
   if (typeof firstChoice !== "object" || firstChoice === null) return null;
-  const delta = (firstChoice as Record<string, unknown>).delta;
+  const choice = firstChoice as Record<string, unknown>;
+  const delta = choice.delta;
+  if ((delta === undefined || delta === null) && choice.finish_reason !== null && choice.finish_reason !== undefined) {
+    return { text: "", reasoning: "", toolCalls: [] };
+  }
   if (typeof delta !== "object" || delta === null) return null;
   const deltaRecord = delta as Record<string, unknown>;
-  if ("tool_calls" in deltaRecord || "function_call" in deltaRecord) return null;
-  if (deltaRecord.content === undefined || deltaRecord.content === null) return "";
-  return typeof deltaRecord.content === "string" ? deltaRecord.content : null;
+  if ("function_call" in deltaRecord) return null;
+  let text = "";
+  if (deltaRecord.content !== undefined && deltaRecord.content !== null) {
+    if (typeof deltaRecord.content !== "string") return null;
+    text = deltaRecord.content;
+  }
+  const reasoning = typeof deltaRecord.reasoning_content === "string" ? deltaRecord.reasoning_content : "";
+  const toolCalls: Array<{ index: number; id: string; type: string; name: string; arguments: string }> = [];
+  if (deltaRecord.tool_calls !== undefined) {
+    if (!Array.isArray(deltaRecord.tool_calls)) return null;
+    for (const part of deltaRecord.tool_calls) {
+      if (typeof part !== "object" || part === null) return null;
+      const call = part as Record<string, unknown>;
+      if (typeof call.index !== "number" || !Number.isInteger(call.index) || call.index < 0) return null;
+      const fn = call.function;
+      if (fn !== undefined && (typeof fn !== "object" || fn === null)) return null;
+      const functionRecord = (fn ?? {}) as Record<string, unknown>;
+      if (
+        (call.id !== undefined && typeof call.id !== "string") ||
+        (call.type !== undefined && typeof call.type !== "string") ||
+        (functionRecord.name !== undefined && typeof functionRecord.name !== "string") ||
+        (functionRecord.arguments !== undefined && typeof functionRecord.arguments !== "string")
+      ) return null;
+      toolCalls.push({
+        index: call.index,
+        id: typeof call.id === "string" ? call.id : "",
+        type: typeof call.type === "string" ? call.type : "",
+        name: typeof functionRecord.name === "string" ? functionRecord.name : "",
+        arguments: typeof functionRecord.arguments === "string" ? functionRecord.arguments : "",
+      });
+    }
+  }
+  return { text, reasoning, toolCalls };
 }
 
 function toLmStudioMessage(message: ModelMessage): Record<string, unknown> {

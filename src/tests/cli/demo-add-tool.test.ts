@@ -7,7 +7,7 @@ import {
 } from "../../packages/core/agent";
 import type { Message } from "../../packages/core/session";
 import { FakeProvider } from "../../packages/providers/fake-provider";
-import { createDemoAddTool } from "../../apps/cli/demo-tools";
+import { createDemoAddTool } from "../../packages/application";
 
 const userMessage: Message = {
   id: "user-1",

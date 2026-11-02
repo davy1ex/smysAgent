@@ -1,6 +1,6 @@
 # ADR-0010: End-to-end text streaming
 
-- Статус: Accepted
+- Статус: Superseded by ADR-0012
 - Дата: 2026-10-30
 - Утвердил: владелец проекта в чате
 

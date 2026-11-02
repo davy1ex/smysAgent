@@ -3,14 +3,13 @@ import { randomUUID } from "node:crypto";
 import {
   AgentRuntimeError,
   createSession,
+  executeTurn,
   getHistory,
   InvalidArgumentError,
   listSessions,
-  runAgentTurn,
-  runAgentTurnStreaming,
   SessionNotFoundError,
+  type AgentTool,
   type SessionRepository,
-  type StreamingTextGenerationProvider,
   type TextGenerationProvider,
 } from "../../packages/application";
 import { LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
@@ -26,9 +25,10 @@ interface ApiFailure {
 export interface WebApiDependencies {
   repository: SessionRepository;
   provider: TextGenerationProvider;
+  tools?: readonly AgentTool[];
 }
 
-export function createWebApiServer({ repository, provider }: WebApiDependencies): Server {
+export function createWebApiServer({ repository, provider, tools = [] }: WebApiDependencies): Server {
   let mutationQueue = Promise.resolve();
 
   const serializeMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -38,7 +38,7 @@ export function createWebApiServer({ repository, provider }: WebApiDependencies)
   };
 
   return createServer((request, response) => {
-    void handleRequest(request, response, repository, provider, serializeMutation);
+    void handleRequest(request, response, repository, provider, tools, serializeMutation);
   });
 }
 
@@ -47,6 +47,7 @@ async function handleRequest(
   response: ServerResponse,
   repository: SessionRepository,
   provider: TextGenerationProvider,
+  availableTools: readonly AgentTool[],
   serializeMutation: <T>(operation: () => Promise<T>) => Promise<T>,
 ): Promise<void> {
   try {
@@ -76,6 +77,7 @@ async function handleRequest(
       if (typeof body.text !== "string") {
         throw new InvalidArgumentError("Message text must be a string.");
       }
+      const allowedTools = resolveAllowedTools(body.allowTools, availableTools);
       const runId = randomUUID();
       const abortController = new AbortController();
       const abortOnRequest = () => abortController.abort();
@@ -90,6 +92,7 @@ async function handleRequest(
           provider,
           sessionId,
           body.text as string,
+          allowedTools,
           runId,
           response,
           abortController.signal,
@@ -108,13 +111,25 @@ async function handleRequest(
       if (typeof body.text !== "string") {
         throw new InvalidArgumentError("Message text must be a string.");
       }
+      const allowedTools = resolveAllowedTools(body.allowTools, availableTools);
       const runId = randomUUID();
       const result = await serializeMutation(async () => {
         try {
-          const turn = await runAgentTurn(repository, provider, { sessionId, text: body.text as string, runId });
+          const turn = await executeTurn(
+            repository,
+            provider,
+            { sessionId, text: body.text as string, runId },
+            createWebAgentOptions(allowedTools),
+          );
           return {
             status: 200,
-            body: { ok: true, runId: turn.runId, userMessage: turn.userMessage, assistantMessage: turn.assistantMessage },
+            body: {
+              ok: true,
+              runId: turn.runId,
+              userMessage: turn.userMessage,
+              assistantMessage: turn.assistantMessage,
+              ...(turn.reasoning === undefined ? {} : { reasoning: turn.reasoning }),
+            },
           };
         } catch (error) {
           const failure = toApiFailure(error);
@@ -148,6 +163,7 @@ async function streamTurnResponse(
   provider: TextGenerationProvider,
   sessionId: string,
   text: string,
+  allowedTools: readonly AgentTool[],
   runId: string,
   response: ServerResponse,
   signal: AbortSignal,
@@ -163,26 +179,22 @@ async function streamTurnResponse(
   let turnId: string | undefined;
 
   try {
-    if (!isStreamingProvider(provider)) {
-      throw new StreamingNotSupportedError();
-    }
-    const turn = await runAgentTurnStreaming(
+    await executeTurn(
       repository,
       provider,
       { sessionId, text, runId },
       {
+        ...createWebAgentOptions(allowedTools),
         signal,
-        onStarted: async (startedRunId, userMessage) => {
-          turnId = userMessage.id;
-          await writeSse(response, signal, "turn.started", { runId: startedRunId, userMessage });
+        onTextDelta: () => undefined,
+        onEvent: async (event) => {
+          if (event.type === "turn.failed") return;
+          if (event.type === "turn.started") turnId = event.userMessage.id;
+          const { type, ...payload } = event;
+          await writeSse(response, signal, type, { ...payload, runId });
         },
-        onTextDelta: (delta) => writeSse(response, signal, "assistant.delta", { runId, text: delta }),
       },
     );
-    await writeSse(response, signal, "turn.completed", {
-      runId: turn.runId,
-      assistantMessage: turn.assistantMessage,
-    });
   } catch (error) {
     if (signal.aborted || response.destroyed) return;
     const failure = toApiFailure(error);
@@ -200,8 +212,34 @@ async function streamTurnResponse(
   }
 }
 
-function isStreamingProvider(provider: TextGenerationProvider): provider is TextGenerationProvider & StreamingTextGenerationProvider {
-  return "streamText" in provider && typeof provider.streamText === "function";
+function createWebAgentOptions(allowedTools: readonly AgentTool[]) {
+  if (allowedTools.length === 0) return {};
+  const allowedNames = new Set(allowedTools.map((tool) => tool.definition.name));
+  return {
+    tools: allowedTools,
+    permissionPolicy: {
+      async authorize(request: { toolName: string }) {
+        return allowedNames.has(request.toolName) ? "allow" as const : "deny" as const;
+      },
+    },
+  };
+}
+
+function resolveAllowedTools(value: unknown, availableTools: readonly AgentTool[]): readonly AgentTool[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((name) => typeof name !== "string") || new Set(value).size !== value.length) {
+    throw new InvalidArgumentError("allowTools must be an array of unique tool names.");
+  }
+  const byName = new Map(availableTools.map((tool) => [tool.definition.name, tool]));
+  const selected: AgentTool[] = [];
+  for (const name of value as string[]) {
+    const tool = byName.get(name);
+    if (tool === undefined) {
+      throw new InvalidArgumentError(`Tool is not available: ${name}`);
+    }
+    selected.push(tool);
+  }
+  return selected;
 }
 
 async function writeSse(
@@ -308,11 +346,11 @@ function toApiFailure(error: unknown): ApiFailure {
   if (error instanceof LmStudioProviderError) {
     return failure(502, "PROVIDER_ERROR", error.message);
   }
-  if (error instanceof StreamingNotSupportedError) {
-    return failure(502, "STREAMING_UNSUPPORTED", error.message);
-  }
   if (error instanceof AgentRuntimeError) {
     return failure(502, error.code, error.message);
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return failure(502, "ABORTED", "Turn was cancelled.");
   }
   return failure(500, "INTERNAL_ERROR", "An unexpected error occurred.");
 }
@@ -332,9 +370,3 @@ function sendJson(response: ServerResponse, status: number, body: Record<string,
 }
 
 class HttpInputError extends Error {}
-class StreamingNotSupportedError extends Error {
-  constructor() {
-    super("The configured provider does not support text streaming.");
-    this.name = "StreamingNotSupportedError";
-  }
-}

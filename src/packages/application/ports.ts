@@ -5,6 +5,8 @@ export interface AgentExecutionOptions {
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
   onEvent?: AgentEventHandler;
+  onTextDelta?: (text: string) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 export interface UserMessageDraft {

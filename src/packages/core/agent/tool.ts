@@ -15,13 +15,14 @@ export interface ToolCall {
 export interface AgentTool {
   definition: ToolDefinition;
   validateInput(input: unknown): boolean;
-  execute(input: unknown, context: { sessionId: SessionId }): Promise<string>;
+  execute(input: unknown, context: { sessionId: SessionId; signal?: AbortSignal }): Promise<string>;
 }
 
 export interface ToolPermissionRequest {
   sessionId: SessionId;
   toolName: string;
   input: unknown;
+  signal?: AbortSignal;
 }
 
 export interface ToolPermissionPolicy {

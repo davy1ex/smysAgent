@@ -1,4 +1,4 @@
-import type { AgentTool } from "../../packages/core/agent";
+import type { AgentTool } from "../core/agent";
 
 interface DemoAddInput {
   a: number;

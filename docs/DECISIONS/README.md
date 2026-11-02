@@ -17,8 +17,9 @@ AI может исследовать варианты, подготовить п
 - [ADR-0007: Статический React web-макет](ADR-0007-static-react-web-preview.md) — отдельный Vite-пакет для оценки чата на локальных UI-фикстурах без подключения Application API.
 - [ADR-0008: Shell и компактная лента агента](ADR-0008-ui-shell-compact-timeline.md) — локальная навигация по демо-сессиям, вкладки Chat/Trajectory и три состояния tool call без изменения backend-контрактов.
 - [ADR-0009: Локальный HTTP host для Web](ADR-0009-local-web-host.md) — браузер вызывает Application API через loopback Node host; provider и JSON store остаются на стороне host.
-- [ADR-0010: End-to-end text streaming](ADR-0010-end-to-end-text-streaming.md) — отдельный SSE endpoint передаёт текстовые чанки Web-клиенту; финальный ответ сохраняется после чистого завершения потока.
-- [ADR-0011: Внутренний контракт событий хода агента](ADR-0011-agent-event-contract.md) — Core сообщает model/tool/reasoning события, Application сообщает lifecycle после сохранения сообщений; события пока не сохраняются и не передаются Web host.
+- [ADR-0010: End-to-end text streaming](ADR-0010-end-to-end-text-streaming.md) — superseded by ADR-0012; исходное решение о раздельном streaming пути.
+- [ADR-0011: Внутренний контракт событий хода агента](ADR-0011-agent-event-contract.md) — расширен ADR-0012; общий внутренний порядок model/tool/reasoning и turn events.
+- [ADR-0012: Единое исполнение хода агента](ADR-0012-unified-agent-execution.md) — один Application lifecycle и Core loop для text streaming, tool calls, reasoning и отмены; host адаптируют вывод и разрешённые capabilities.
 
 ## Шаблон
 

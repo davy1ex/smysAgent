@@ -14,10 +14,13 @@ export type ModelResponse =
   | { kind: "final"; text: string; reasoning?: string }
   | { kind: "tool-call"; callId: string; name: string; arguments: unknown; reasoning?: string };
 
-export interface TextGenerationProvider {
-  generate(request: ModelRequest): Promise<ModelResponse>;
+export type ModelTextDeltaHandler = (text: string) => void | Promise<void>;
+
+export interface ModelGenerationOptions {
+  signal?: AbortSignal;
+  onTextDelta?: ModelTextDeltaHandler;
 }
 
-export interface StreamingTextGenerationProvider {
-  streamText(request: ModelRequest, options?: { signal?: AbortSignal }): AsyncIterable<string>;
+export interface TextGenerationProvider {
+  generate(request: ModelRequest, options?: ModelGenerationOptions): Promise<ModelResponse>;
 }

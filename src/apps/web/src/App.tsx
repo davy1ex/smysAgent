@@ -15,7 +15,7 @@ import {
 const mobileBreakpoint = "(max-width: 760px)";
 
 type TurnStatus = "pending" | "completed" | "error" | "cancelled";
-type PendingTurn = { sessionId: string; id: string; text: string; assistantText: string; createdAt: string };
+type PendingTurn = { sessionId: string; id: string; text: string; assistantText: string; createdAt: string; activity?: string };
 
 function formatTime(value: string): string {
   const date = new Date(value);
@@ -38,6 +38,8 @@ function MessageItem({
   streaming = false,
   compact = false,
   stepNumber,
+  reasoning,
+  activity,
 }: {
   message: SessionMessage;
   turnStatus?: TurnStatus | undefined;
@@ -45,6 +47,8 @@ function MessageItem({
   streaming?: boolean;
   compact?: boolean;
   stepNumber?: number;
+  reasoning?: string | undefined;
+  activity?: string | undefined;
 }) {
   const isUser = message.role === "user";
   const statusIcon = turnStatus === "pending" ? "loader" : turnStatus === "error" || turnStatus === "cancelled" ? "alert" : "check";
@@ -69,6 +73,13 @@ function MessageItem({
           {message.content[0]?.text || (streaming ? "Генерируется ответ…" : "")}
           {streaming && message.content[0]?.text.length > 0 && <span className="streaming-cursor" aria-hidden="true">▍</span>}
         </p>
+        {activity && !isUser && <small className="turn-activity">{activity}</small>}
+        {reasoning && !isUser && (
+          <details className="turn-reasoning">
+            <summary>Рассуждение модели</summary>
+            <p>{reasoning}</p>
+          </details>
+        )}
         {isUser && turnStatus && (
           <div className={`turn-status turn-${turnStatus}`} role={turnStatus === "error" ? "alert" : "status"}>
             <Icon name={statusIcon} size={12} />
@@ -109,12 +120,14 @@ function ChatTimeline({
   pending,
   failedTurns,
   stoppedTurns,
+  reasoningByMessage,
 }: {
   session: SessionSummary;
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
   failedTurns: ReadonlyMap<string, string>;
   stoppedTurns: ReadonlySet<string>;
+  reasoningByMessage: Readonly<Record<string, string>>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === session.id ? appendPendingMessage(messages, pending) : messages;
@@ -143,6 +156,8 @@ function ChatTimeline({
             turnStatus={status}
             turnError={failedTurns.get(message.id)}
             streaming={message.id === `${pending?.id}-assistant`}
+            activity={message.id === `${pending?.id}-assistant` ? pending?.activity : undefined}
+            reasoning={reasoningByMessage[message.id]}
           />
         );
       })}
@@ -159,12 +174,14 @@ function Trajectory({
   sessionId,
   failedTurns,
   stoppedTurns,
+  reasoningByMessage,
 }: {
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
   sessionId: string;
   failedTurns: ReadonlyMap<string, string>;
   stoppedTurns: ReadonlySet<string>;
+  reasoningByMessage: Readonly<Record<string, string>>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === sessionId ? appendPendingMessage(messages, pending) : messages;
@@ -203,6 +220,8 @@ function Trajectory({
                   turnStatus={status}
                   turnError={failedTurns.get(message.id)}
                   streaming={message.id === `${pending?.id}-assistant`}
+                  activity={message.id === `${pending?.id}-assistant` ? pending?.activity : undefined}
+                  reasoning={reasoningByMessage[message.id]}
                 />
               </div>
             );
@@ -313,13 +332,17 @@ function Composer({
   disabled,
   sending,
   error,
+  allowDemoAdd,
+  onAllowDemoAddChange,
   onSend,
   onCancel,
 }: {
   disabled: boolean;
   sending: boolean;
   error: string;
-  onSend: (text: string) => Promise<void>;
+  allowDemoAdd: boolean;
+  onAllowDemoAddChange: (allow: boolean) => void;
+  onSend: (text: string, allowDemoAdd: boolean) => Promise<void>;
   onCancel: () => void;
 }) {
   const [text, setText] = useState("");
@@ -328,7 +351,7 @@ function Composer({
     const value = text.trim();
     if (!value || disabled || sending) return;
     setText("");
-    void onSend(value);
+    void onSend(value, allowDemoAdd);
   };
 
   return (
@@ -348,6 +371,15 @@ function Composer({
             }
           }}
         />
+        <label className="composer-tool-permission">
+          <input
+            type="checkbox"
+            checked={allowDemoAdd}
+            disabled={disabled || sending}
+            onChange={(event) => onAllowDemoAddChange(event.target.checked)}
+          />
+          <span>Разрешить demo.add только для этого хода</span>
+        </label>
         <div className="composer-toolbar">
           <span className="composer-note">Enter — отправить · Shift+Enter — новая строка</span>
           <div className="composer-controls">
@@ -374,11 +406,13 @@ export function App() {
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(mobileBreakpoint).matches);
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia(mobileBreakpoint).matches);
   const [pending, setPending] = useState<PendingTurn | null>(null);
+  const [reasoningByMessage, setReasoningByMessage] = useState<Readonly<Record<string, string>>>({});
   const [failedTurns, setFailedTurns] = useState<ReadonlyMap<string, string>>(() => new Map());
   const [stoppedTurns, setStoppedTurns] = useState<ReadonlySet<string>>(() => new Set());
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [sending, setSending] = useState(false);
+  const [allowDemoAdd, setAllowDemoAdd] = useState(false);
   const [error, setError] = useState("");
   const streamController = useRef<AbortController | null>(null);
 
@@ -461,12 +495,13 @@ export function App() {
     if (isMobile) setSidebarOpen(false);
   };
 
-  const submitMessage = async (text: string) => {
+  const submitMessage = async (text: string, allowDemoAdd: boolean) => {
     if (!activeSessionId || sending) return;
     const sessionId = activeSessionId;
     const previousMessageCount = historyBySession[sessionId]?.messages.length ?? 0;
     const optimisticId = `pending-${crypto.randomUUID()}`;
     const controller = new AbortController();
+    setAllowDemoAdd(false);
     streamController.current = controller;
     setPending({ sessionId, id: optimisticId, text, assistantText: "", createdAt: new Date().toISOString() });
     setSending(true);
@@ -483,7 +518,22 @@ export function App() {
             ? { ...current, assistantText: current.assistantText + delta }
             : current);
         },
-      }, controller.signal);
+        onRuntimeEvent: (event, payload) => {
+          const activity = event === "tool.started"
+            ? `Выполняется ${typeof payload.name === "string" ? payload.name : "инструмент"}…`
+            : event === "tool.completed"
+              ? "Инструмент завершил работу"
+              : event === "model.started"
+                ? "Модель формирует ответ…"
+                : undefined;
+          if (activity !== undefined) {
+            setPending((current) => current?.sessionId === sessionId ? { ...current, activity } : current);
+          }
+        },
+      }, controller.signal, allowDemoAdd ? ["demo.add"] : []);
+      if (turn.reasoning !== undefined) {
+        setReasoningByMessage((current) => ({ ...current, [turn.assistantMessage.id]: turn.reasoning! }));
+      }
       setHistoryBySession((current) => {
         const previous = current[sessionId] ?? { session: { id: sessionId, createdAt: turn.userMessage.createdAt }, messages: [] };
         const existing = new Set(previous.messages.map((message) => message.id));
@@ -612,12 +662,12 @@ export function App() {
             ? <div className="empty-state"><Icon name="loader" size={18} />Загружаются сессии…</div>
             : selected
               ? activeTab === "chat"
-                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} failedTurns={failedTurns} stoppedTurns={stoppedTurns} />
-                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} failedTurns={failedTurns} stoppedTurns={stoppedTurns} />
+                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} failedTurns={failedTurns} stoppedTurns={stoppedTurns} reasoningByMessage={reasoningByMessage} />
+                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} failedTurns={failedTurns} stoppedTurns={stoppedTurns} reasoningByMessage={reasoningByMessage} />
               : <div className="empty-state"><Icon name="chat" size={20} /><strong>Начните новый диалог</strong><span>Создайте сессию, чтобы отправить запрос агенту.</span><button type="button" onClick={() => { void createNewSession(); }}>Создать чат</button></div>}
         </section>
 
-        <Composer disabled={!selected} sending={sending} error={error} onSend={submitMessage} onCancel={cancelCurrentTurn} />
+        <Composer disabled={!selected} sending={sending} error={error} allowDemoAdd={allowDemoAdd} onAllowDemoAddChange={setAllowDemoAdd} onSend={submitMessage} onCancel={cancelCurrentTurn} />
       </main>
     </div>
   );

@@ -11,7 +11,7 @@ export type AgentRuntimeEvent =
 
 export type AgentEvent = AgentRuntimeEvent
   | { type: "turn.started"; runId: string; userMessage: UserMessage }
-  | { type: "turn.completed"; runId: string; assistantMessage: AssistantMessage }
+  | { type: "turn.completed"; runId: string; assistantMessage: AssistantMessage; reasoning?: string }
   | { type: "turn.failed"; runId: string; code: string };
 
 export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;

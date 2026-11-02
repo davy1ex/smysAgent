@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; end-to-end text streaming — в ADR-0010; внутренний контракт событий Runtime/Application — в ADR-0011. HTTP-передача событий, record/replay и сохранённая trajectory остаются будущими сценариями.
+**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; единое исполнение и event streaming — в ADR-0012. Record/replay и сохранённая trajectory остаются будущими сценариями.
 
 ## Принципы проектирования
 
@@ -22,7 +22,7 @@ CLI — ранний headless-вход для ручного запуска, с�
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
-Runtime/Application callback для событий хода реализован, но HTTP-передача agent events, сохранённая trajectory, projects и расширение схемы хранения остаются будущими задачами. Потоковый текст Web описан в отдельном HTTP-контракте ниже; он использует существующий SSE-контракт.
+`executeTurn` и один Core runtime loop обслуживают hosts с текстовым и потоковым выводом. Application events передаются через callback; Web host переносит runtime events в SSE. События и reasoning не сохраняются в store; record/replay, projects и расширение схемы хранения остаются будущими задачами.
 
 ### Сигнатуры реализованных use cases
 
@@ -32,8 +32,9 @@ Runtime/Application callback для событий хода реализован
 createSession(repository: SessionRepository): Promise<Session>
 listSessions(repository: SessionRepository): Promise<SessionSummary[]>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-runAgentTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
-runAgentTurnStreaming(repository: SessionRepository, provider: TextGenerationProvider & StreamingTextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, handlers: AgentTurnStreamHandlers, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }>
+executeTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
+runAgentTurn(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> // compatibility delegate
+runAgentTurnStreaming(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }> // compatibility delegate
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
 
 interface SessionSummary {
@@ -55,6 +56,8 @@ interface AgentExecutionOptions {
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
   onEvent?: AgentEventHandler;
+  onTextDelta?: (text: string) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 type AgentRuntimeEvent =
@@ -68,17 +71,13 @@ type AgentRuntimeEvent =
 
 type AgentEvent = AgentRuntimeEvent
   | { type: "turn.started"; runId: string; userMessage: UserMessage }
-  | { type: "turn.completed"; runId: string; assistantMessage: AssistantMessage }
+  | { type: "turn.completed"; runId: string; assistantMessage: AssistantMessage; reasoning?: string }
   | { type: "turn.failed"; runId: string; code: string };
 
 type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 
 interface TextGenerationProvider {
-  generate(request: ModelRequest): Promise<ModelResponse>;
-}
-
-interface StreamingTextGenerationProvider {
-  streamText(request: ModelRequest, options?: { signal?: AbortSignal }): AsyncIterable<string>;
+  generate(request: ModelRequest, options?: { signal?: AbortSignal; onTextDelta?: (text: string) => void | Promise<void> }): Promise<ModelResponse>;
 }
 
 interface AgentTurnStreamHandlers {
@@ -88,9 +87,9 @@ interface AgentTurnStreamHandlers {
 }
 ```
 
-`listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `runAgentTurn` сохраняет пользователя, загружает историю, запускает ограниченный runtime и сохраняет финальный текст ассистента. Вызов получает или генерирует `runId`; это идентификатор хода без сохранённого execution trace. При наличии reasoning application API возвращает его отдельным необязательным полем; CLI показывает его вместе с финальным ответом, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; при явном `--tool demo.add` передаёт один tool и policy, которая разрешает его только при `--allow-tool demo.add`. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке provider, инструмента или разрешения пользовательское сообщение остаётся в истории без ответа. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `executeTurn` сохраняет пользователя, загружает историю, запускает единый runtime и сохраняет финальный текст ассистента. Вызов получает или генерирует `runId`; это идентификатор хода без сохранённого execution trace. При наличии reasoning API возвращает его отдельно; Web и CLI могут отобразить его, но store и история сессии содержат только финальный текст. Если reasoning вернулось в нескольких вызовах модели, runtime объединяет части через пустую строку. CLI по умолчанию не передаёт инструменты; `--tool demo.add` подключает его, а отдельный `--allow-tool demo.add` разрешает исполнение. Web передаёт `allowTools` только после явного выбора для текущего хода. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке или отмене после записи пользователя ответ ассистента не добавляется. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
-Необязательный `onEvent` получает события последовательно. Runtime отправляет `model.started`, `model.completed`, непустые `reasoning.completed`, `tool.requested`, `tool.started` и `tool.completed`; потоковый Runtime также отправляет `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с сохранением: `turn.started` идёт после записи user message, `turn.completed` — после записи assistant message, `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Callback не сохраняет события и не меняет HTTP-контракт Web.
+Необязательный `onEvent` получает события последовательно при обоих режимах provider. Runtime отправляет `model.started`, `model.completed`, непустые `reasoning.completed`, `tool.requested`, `tool.started`, `tool.completed` и, если задан `onTextDelta`, `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с сохранением: `turn.started` идёт после записи user message, `turn.completed` — после записи assistant message и может содержать временное `reasoning`, `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Callback не сохраняет события.
 
 ### Local Web HTTP API
 
@@ -101,10 +100,12 @@ Host `src/apps/web-host` слушает только `127.0.0.1` (порт по 
 | `GET /api/sessions` | Возвращает `{ ok, sessions }`; элемент содержит `id`, `createdAt`, `updatedAt`, `title`. |
 | `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию и возвращает `{ ok, session }` с HTTP 201. |
 | `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages }` по `sequence`. |
-| `POST /api/sessions/:id/messages` | Принимает `{ text }`, вызывает `runAgentTurn`, возвращает `runId`, `userMessage` и `assistantMessage`. Запрос ждёт завершения provider; streaming отсутствует. |
-| `POST /api/sessions/:id/messages/stream` | Принимает `{ text }`, вызывает `runAgentTurnStreaming` и возвращает SSE события `turn.started`, `assistant.delta`, `turn.completed` или `turn.failed`. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. Поддерживаются только ходы без tools. |
+| `POST /api/sessions/:id/messages` | Принимает `{ text, allowTools? }`, вызывает `executeTurn` и возвращает `runId`, `userMessage`, `assistantMessage` и необязательный `reasoning`. Запрос ждёт завершения provider. |
+| `POST /api/sessions/:id/messages/stream` | Принимает `{ text, allowTools? }`, вызывает тот же `executeTurn` и возвращает SSE lifecycle, model, reasoning, tool и text-delta events. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. |
 
-Формат SSE события — `event: <type>` и одна JSON-строка `data:`. `turn.started` содержит `{ runId, userMessage }`; `assistant.delta` — `{ runId, text }`; `turn.completed` — `{ runId, assistantMessage }`; `turn.failed` — `{ runId, error: { code, message, turnId? } }`. Начальное событие отправляется после сохранения user message. Текстовые чанки временные и не записываются отдельно; Application сохраняет объединённый ответ один раз только после корректного завершения provider. `turn.completed` отправляется после успешной записи assistant message. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
+Формат SSE события — `event: <type>` и одна JSON-строка `data:`. В payload каждого события есть `runId`. Lifecycle-события содержат `{ userMessage }`, `{ assistantMessage, reasoning? }` или `{ error: { code, message, turnId? } }`; остальные используют поля соответствующего `AgentRuntimeEvent`. Начальное событие отправляется после сохранения user message. Текстовые чанки и reasoning временные; Application сохраняет объединённый ответ один раз только после корректного завершения provider. `turn.completed` отправляется после успешной записи assistant message. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
+
+`allowTools` — необязательный массив уникальных имён инструментов. Web host отклоняет неизвестные имена; пустой или отсутствующий массив оставляет Runtime без tools. Каждый выбранный инструмент передаётся с policy, которая разрешает только grant текущего запроса. Встроенный UI запрашивает grant `demo.add` отдельным checkbox и сбрасывает его после отправки.
 
 Ошибки имеют форму `{ ok: false, error: { code, message, runId?, turnId? } }`. Неверный запрос возвращает 400, отсутствующая сессия — 404, сбой provider/runtime — 502, ошибка хранилища или неизвестная ошибка — 500. При сбое после сохранения user message host возвращает её `turnId`, чтобы UI показал ошибку на соответствующем ходе; безопасное сообщение ошибки не содержит токен или ответ сервера LM Studio.
 
@@ -136,8 +137,8 @@ Fake provider используется по умолчанию. Для LM Studio
 session create [--initial-message <text>] [--data-dir <path>] [--json]
 message send --session-id <id> --text <text> [--data-dir <path>] [--json]
 history get --session-id <id> [--data-dir <path>] [--json]
-agent run --provider fake --session-id <id> --text <text> [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json]
-agent run --provider lm-studio --model <model-id> --session-id <id> --text <text> [--endpoint <url>] [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json]
+agent run --provider fake --session-id <id> --text <text> [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json] [--stream [--output ndjson]]
+agent run --provider lm-studio --model <model-id> --session-id <id> --text <text> [--endpoint <url>] [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json] [--stream [--output ndjson]]
 ```
 
 `session create --initial-message <text>` вызывает application use case создания сессии и затем use case сохранения сообщения. Эта форма нужна в том числе для процессной проверки: один запуск CLI создаёт сессию и сохраняет сообщение, следующий отдельный запуск читает историю.
@@ -158,9 +159,9 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 {"ok":true,"runId":"...","userMessage":{"id":"..."},"assistantMessage":{"id":"...","role":"assistant","content":[{"type":"text","text":"..."}]},"reasoning":"..."}
 ```
 
-Каждый ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища. Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. Без `--json` используются краткие текстовые сообщения.
+Каждый обычный JSON-ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища, `130` отмена по SIGINT (`ABORTED`). Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. `--stream` печатает текстовые дельты и завершает строку после успешного ответа; `--stream --output ndjson` печатает по одному JSON событию на строку, включая `turn.completed`. Потоковый режим несовместим с `--json`; прежний `--json` вывод не меняется.
 
-Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; текстовый вывод печатает его под заголовком `Reasoning:` перед финальным ответом. Это поле относится к текущему выполнению и не добавляется в сохранённый `assistantMessage` или историю.
+Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; обычный текстовый вывод печатает его перед финальным ответом, а `--stream` направляет reasoning в stderr. Это поле относится к текущему выполнению и не добавляется в сохранённый `assistantMessage` или историю.
 
 `agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
 
@@ -203,6 +204,7 @@ type ToolPermissionRequest = {
   sessionId: SessionId;
   toolName: string;
   input: unknown;
+  signal?: AbortSignal;
 };
 
 type AgentEvent = {
@@ -242,7 +244,9 @@ interface AgentTurnResult {
 }
 ```
 
-Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. `generate()` в LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions` с `stream: false` и читает reasoning из `reasoning_content`. Для Web text streaming `streamText()` отправляет `stream: true`, разбирает OpenAI-compatible SSE data и выдаёт только `delta.content`; reasoning не отображается как текст, а tool calls в этом режиме отклоняются. Если для обычного `generate()` переданы инструменты, adapter добавляет один `tools` элемент и `tool_choice: "auto"`; ответ должен содержать ровно один корректный вызов функции. Для следующего запроса adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Runtime возвращает reasoning всех вызовов модели за обычный ход в порядке получения, разделяя части пустой строкой. Ошибки соединения, HTTP, формата ответа, незавершённого потока и пустого текста превращаются в безопасную provider-ошибку; повторов и fallback нет. Capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
+Fake provider по умолчанию возвращает детерминированный текстовый ответ; тест может задать сценарий ответов. `TextGenerationProvider.generate(request, options?)` всегда возвращает нормализованный `ModelResponse`. Если передан `onTextDelta`, provider выдаёт текстовые чанки последовательно и затем возвращает итоговый ответ; tool-call fragments собираются до возврата. `signal` поддерживает отмену обоих режимов.
+
+LM Studio отправляет всю историю через OpenAI-compatible `POST /v1/chat/completions`: без `onTextDelta` использует `stream: false`; с callback — `stream: true`. В streaming режиме adapter передаёт `delta.content`, собирает `reasoning_content` и один tool call из `delta.tool_calls`; имя, ID и JSON аргументы валидируются до передачи runtime. Ответы с несколькими вызовами инструмента, некорректными fragments, смешанным текстом и tool call, пустым текстом или незавершённым потоком отклоняются. Для следующего model call adapter сериализует временные сообщения в assistant `tool_calls` и сообщение роли `tool`. Runtime возвращает reasoning всех вызовов модели в порядке получения, разделяя части пустой строкой. Ошибки соединения, HTTP и формата превращаются в безопасную provider-ошибку; повторов и fallback нет. Capability discovery и дополнительные модельные настройки остаются вне текущего контракта.
 
 ## Ограниченный контракт инструментов и разрешений
 
@@ -250,7 +254,7 @@ Fake provider по умолчанию возвращает детерминир�
 interface AgentTool {
   definition: ToolDefinition;
   validateInput(input: unknown): boolean;
-  execute(input: unknown, context: { sessionId: SessionId }): Promise<string>;
+  execute(input: unknown, context: { sessionId: SessionId; signal?: AbortSignal }): Promise<string>;
 }
 
 interface ToolPermissionPolicy {
@@ -258,11 +262,11 @@ interface ToolPermissionPolicy {
 }
 ```
 
-В одном ходе можно передать максимум один инструмент. `inputSchema` описывает аргументы provider, а локальный `validateInput` проверяет их перед выполнением; общий JSON Schema engine не добавлен, поэтому реализация инструмента должна поддерживать соответствие этих двух описаний. Runtime проверяет имя и `validateInput`, затем вызывает policy и выполняет инструмент только при ответе `allow`; отсутствие policy делает конфигурацию с инструментом недействительной. `ask-user` не поддерживается, поскольку application API пока не имеет host для подтверждения. Лимит — два вызова модели и один вызов инструмента за ход; повторный tool call отклоняется до выполнения. Ошибки имени, аргументов, разрешения, инструмента и лимита завершают ход без финального ответа.
+В одном ходе можно передать максимум один инструмент. `inputSchema` описывает аргументы provider, а локальный `validateInput` проверяет их перед выполнением; общий JSON Schema engine не добавлен, поэтому реализация инструмента должна поддерживать соответствие этих двух описаний. Runtime проверяет имя и `validateInput`, затем вызывает policy и выполняет инструмент только при ответе `allow`; отсутствие policy делает конфигурацию с инструментом недействительной. CLI требует отдельные `--tool` и `--allow-tool`; Web передаёт выбранный пользователем `allowTools` список только на текущий ход, а host формирует policy исключительно по этому списку. `ask-user` в середине хода не поддерживается; Web grant даётся перед отправкой запроса. Лимит — два вызова модели и один вызов инструмента за ход; повторный tool call отклоняется до выполнения. Ошибки имени, аргументов, разрешения, инструмента и лимита завершают ход без финального ответа.
 
 Вызовы и результаты инструментов добавляются только во временный контекст provider. Формат store v2 не изменён: сохраняются пользовательское сообщение и финальный текст ассистента. При ошибке после записи пользователя ответ ассистента не добавляется.
 
-Runtime ограничивает ход двумя запросами модели и одним вызовом инструмента. Итерация — один запрос provider и один ответ; само выполнение инструмента отдельной итерацией не считается. Инструменты передаются вызывающим application code; динамической загрузки, discovery, повторов и обработки `ask-user` нет. Ошибки runtime типизированы (`INVALID_CONFIGURATION`, `INVALID_MODEL_RESPONSE`, `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `PERMISSION_DENIED`, `PERMISSION_CHECK_FAILED`, `TOOL_EXECUTION_FAILED`, `LOOP_LIMIT`); CLI показывает их через существующий `INTERNAL_ERROR` и код выхода `1`.
+Runtime ограничивает ход двумя запросами модели и одним вызовом инструмента. Итерация — один запрос provider и один ответ; само выполнение инструмента отдельной итерацией не считается. Инструменты передаются вызывающим application code; динамической загрузки, discovery, повторов и интерактивного `ask-user` нет. Ошибки runtime типизированы (`INVALID_CONFIGURATION`, `INVALID_MODEL_RESPONSE`, `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `PERMISSION_DENIED`, `PERMISSION_CHECK_FAILED`, `TOOL_EXECUTION_FAILED`, `LOOP_LIMIT`); CLI показывает их через существующий `INTERNAL_ERROR` и код выхода `1`. Отмена provider или tool operation распространяет `AbortSignal`; CLI выводит `ABORTED` с кодом `130` по SIGINT.
 
 При исключении из `AgentTool.execute()` ошибка `TOOL_EXECUTION_FAILED` сохраняет исходное значение в стандартном поле `cause`. Безопасные `code` и `message` остаются прежними; CLI не включает `cause` в текстовый или JSON-ответ.
 

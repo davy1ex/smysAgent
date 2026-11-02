@@ -149,12 +149,10 @@ test("application streaming turn forwards deltas and persists their final text o
   const chunks: string[] = [];
   const events: AgentEvent[] = [];
   const provider = {
-    async generate() {
-      throw new Error("Streaming path should not call generate().");
-    },
-    async *streamText() {
-      yield "streamed ";
-      yield "reply";
+    async generate(_request: unknown, options?: { onTextDelta?: (text: string) => void | Promise<void> }) {
+      await options?.onTextDelta?.("streamed ");
+      await options?.onTextDelta?.("reply");
+      return { kind: "final" as const, text: "streamed reply" };
     },
   };
   let startedUser: UserMessage | undefined;
@@ -192,13 +190,11 @@ test("application streaming cancellation leaves the user message without a false
   const session = await createSession(repository);
   const controller = new AbortController();
   const provider = {
-    async generate() {
-      throw new Error("Streaming path should not call generate().");
-    },
-    async *streamText(_request: unknown, options?: { signal?: AbortSignal }) {
-      yield "partial";
+    async generate(_request: unknown, options?: { onTextDelta?: (text: string) => void | Promise<void>; signal?: AbortSignal }) {
+      await options?.onTextDelta?.("partial");
       options?.signal?.throwIfAborted();
-      yield "unreachable";
+      await options?.onTextDelta?.("unreachable");
+      return { kind: "final" as const, text: "partialunreachable" };
     },
   };
 
@@ -278,6 +274,47 @@ test("application API executes one permitted tool and persists only the final an
   ]);
 });
 
+test("the shared application turn streams its final answer after a permitted tool call", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const provider = new FakeProvider([
+    { kind: "tool-call", callId: "stream-call-1", name: "test.echo", arguments: { text: "from tool" } },
+    { kind: "final", text: "Final: from tool" },
+  ]);
+  const chunks: string[] = [];
+  const events: AgentEvent[] = [];
+  const turn = await runAgentTurnStreaming(
+    repository,
+    provider,
+    { sessionId: session.id, text: "stream the tool result" },
+    { onStarted() {}, onTextDelta(text) { chunks.push(text); } },
+    {
+      tools: [createTestTool()],
+      permissionPolicy: { async authorize() { return "allow"; } },
+      onEvent(event) { events.push(event); },
+    },
+  );
+
+  assert.equal(turn.assistantMessage.content[0]?.text, "Final: from tool");
+  assert.equal(chunks.join(""), "Final: from tool");
+  assert.deepEqual(provider.requests.map((request) => request.tools.length), [1, 0]);
+  assert.deepEqual(events.map((event) => event.type), [
+    "turn.started",
+    "model.started",
+    "model.completed",
+    "tool.requested",
+    "tool.started",
+    "tool.completed",
+    "model.started",
+    "assistant.delta",
+    "assistant.delta",
+    "model.completed",
+    "turn.completed",
+  ]);
+  const history = await getHistory(repository, session.id);
+  assert.deepEqual(history.messages.map((message) => message.role), ["user", "assistant"]);
+});
+
 test("application emits ordered per-call reasoning and tool events around persistence", async () => {
   const repository = new MemorySessionRepository();
   const session = await createSession(repository);
@@ -327,7 +364,12 @@ test("application emits ordered per-call reasoning and tool events around persis
     { type: "model.started", callIndex: 2 },
     { type: "reasoning.completed", callIndex: 2, text: "Use the tool result." },
     { type: "model.completed", callIndex: 2 },
-    { type: "turn.completed", runId: "run-1", assistantMessage: turn.assistantMessage },
+    {
+      type: "turn.completed",
+      runId: "run-1",
+      assistantMessage: turn.assistantMessage,
+      reasoning: "Prepare the tool call.\n\nUse the tool result.",
+    },
   ]);
 });
 

@@ -1,18 +1,19 @@
 import { resolve } from "node:path";
 import { AgentRuntimeError, type ToolPermissionPolicy } from "../../packages/core/agent";
 import {
+  createDemoAddTool,
   createSession,
+  executeTurn,
   getHistory,
   InvalidArgumentError,
-  runAgentTurn,
   sendMessage,
   SessionNotFoundError,
+  type AgentEvent,
   type SessionRepository,
 } from "../../packages/application";
 import { JsonFileSessionRepository, StorageError } from "../../packages/storage";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 import { LmStudioProvider, LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
-import { createDemoAddTool } from "./demo-tools";
 
 const DEFAULT_LM_STUDIO_ENDPOINT = "http://localhost:1234/v1/chat/completions";
 const FAKE_DEMO_ADD_RESPONSES = [
@@ -23,30 +24,42 @@ const FAKE_DEMO_ADD_RESPONSES = [
 type ParsedCommand = {
   command: "session-create" | "message-send" | "history-get" | "agent-run";
   json: boolean;
+  stream: boolean;
+  output: "text" | "ndjson";
   options: Map<string, string>;
 };
 
 interface CliErrorPayload {
-  code: "INVALID_ARGUMENT" | "SESSION_NOT_FOUND" | "STORAGE_ERROR" | "INTERNAL_ERROR";
+  code: "INVALID_ARGUMENT" | "SESSION_NOT_FOUND" | "STORAGE_ERROR" | "INTERNAL_ERROR" | "ABORTED";
   message: string;
 }
 
 export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<number> {
   let json = argv.includes("--json");
+  let stream = false;
+  let ndjson = false;
   try {
     const parsed = parseCommand(argv);
     json = parsed.json;
+    stream = parsed.stream;
+    ndjson = parsed.output === "ndjson";
     validateProviderSettings(parsed, env);
     const dataDir = resolveDataDir(parsed.options.get("data-dir"), env);
     const repository = new JsonFileSessionRepository(dataDir);
+    const controller = parsed.command === "agent-run" ? new AbortController() : undefined;
+    const abortOnInterrupt = () => controller?.abort();
+    if (controller !== undefined) process.once("SIGINT", abortOnInterrupt);
     try {
-      const result = await execute(parsed, repository, env);
-      writeSuccess(result, parsed.json);
+      const result = await execute(parsed, repository, env, controller?.signal);
+      if (!parsed.stream) writeSuccess(result, parsed.json);
+      else if (parsed.output === "text") process.stdout.write("\n");
       return 0;
     } finally {
+      if (controller !== undefined) process.off("SIGINT", abortOnInterrupt);
       await repository.close();
     }
   } catch (error) {
+    if (stream && !ndjson) process.stdout.write("\n");
     const payload = toCliError(error);
     writeError(payload, json);
     return exitCodeFor(payload.code);
@@ -74,11 +87,13 @@ function parseCommand(argv: string[]): ParsedCommand {
       : command === "message-send"
         ? ["data-dir", "session-id", "text"]
         : command === "agent-run"
-          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint", "tool", "allow-tool"]
+          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint", "tool", "allow-tool", "stream", "output"]
           : ["data-dir", "session-id"],
   );
   const options = new Map<string, string>();
   let json = false;
+  let stream = false;
+  let output: "text" | "ndjson" = "text";
   for (let index = 0; index < args.length; index += 1) {
     const option = args[index];
     if (option === "--json") {
@@ -86,6 +101,23 @@ function parseCommand(argv: string[]): ParsedCommand {
         throw new InvalidArgumentError("--json must not be repeated.");
       }
       json = true;
+      continue;
+    }
+    if (option === "--stream") {
+      if (!allowedOptions.has("stream")) throw new InvalidArgumentError(`Unknown option: ${option}`);
+      if (stream) throw new InvalidArgumentError("--stream must not be repeated.");
+      stream = true;
+      continue;
+    }
+    if (option === "--output") {
+      if (!allowedOptions.has("output")) throw new InvalidArgumentError(`Unknown option: ${option}`);
+      if (options.has("output")) throw new InvalidArgumentError("--output must not be repeated.");
+      const value = args[index + 1];
+      if (value === undefined) throw new InvalidArgumentError("--output requires a value.");
+      if (value !== "ndjson") throw new InvalidArgumentError("--output supports only ndjson.");
+      options.set("output", value);
+      output = "ndjson";
+      index += 1;
       continue;
     }
     if (option === undefined || !option.startsWith("--")) {
@@ -145,13 +177,20 @@ function parseCommand(argv: string[]): ParsedCommand {
   if ((command === "message-send" || command === "agent-run") && options.get("text") === "") {
     throw new InvalidArgumentError("--text must not be empty.");
   }
-  return { command, json, options };
+  if (output === "ndjson" && !stream) {
+    throw new InvalidArgumentError("--output ndjson requires --stream.");
+  }
+  if (stream && json) {
+    throw new InvalidArgumentError("--stream cannot be combined with --json.");
+  }
+  return { command, json, stream, output, options };
 }
 
 async function execute(
   parsed: ParsedCommand,
   repository: SessionRepository,
   env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   switch (parsed.command) {
     case "session-create": {
@@ -193,14 +232,28 @@ async function execute(
           permissionPolicy: createCliPermissionPolicy(parsed.options),
         }
         : {};
-      const turn = await runAgentTurn(
+      const streamOptions = parsed.stream
+        ? {
+          onTextDelta: parsed.output === "text"
+            ? (delta: string) => { process.stdout.write(delta); }
+            : () => undefined,
+          onEvent: (event: AgentEvent) => {
+            if (parsed.output === "ndjson") {
+              process.stdout.write(`${JSON.stringify(event)}\n`);
+            } else if (event.type === "reasoning.completed") {
+              process.stderr.write(`Reasoning:\n${event.text}\n`);
+            }
+          },
+        }
+        : {};
+      const turn = await executeTurn(
         repository,
         provider,
         {
           sessionId: requiredOption(parsed.options, "session-id"),
           text: requiredOption(parsed.options, "text"),
         },
-        agentOptions,
+        { ...agentOptions, ...streamOptions, ...(signal === undefined ? {} : { signal }) },
       );
       return { ok: true, ...turn };
     }
@@ -281,6 +334,9 @@ function toCliError(error: unknown): CliErrorPayload {
   if (error instanceof AgentRuntimeError) {
     return { code: "INTERNAL_ERROR", message: error.message };
   }
+  if (error instanceof Error && error.name === "AbortError") {
+    return { code: "ABORTED", message: "Turn was cancelled." };
+  }
   return { code: "INTERNAL_ERROR", message: "An unexpected error occurred." };
 }
 
@@ -294,6 +350,8 @@ function exitCodeFor(code: CliErrorPayload["code"]): number {
       return 4;
     case "INTERNAL_ERROR":
       return 1;
+    case "ABORTED":
+      return 130;
   }
 }
 

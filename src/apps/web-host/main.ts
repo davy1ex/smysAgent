@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import type { TextGenerationProvider } from "../../packages/application";
+import { createDemoAddTool, type TextGenerationProvider } from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 import { LmStudioProvider } from "../../packages/providers/lm-studio-provider";
 import { JsonFileSessionRepository } from "../../packages/storage";
@@ -12,7 +12,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   const port = resolvePort(env.SMYS_WEB_PORT);
   const dataDir = resolve(process.cwd(), env.SMYS_DATA_DIR || ".smys-agent");
   const repository = new JsonFileSessionRepository(dataDir);
-  const server = createWebApiServer({ repository, provider: resolveProvider(env) });
+  const server = createWebApiServer({ repository, provider: resolveProvider(env), tools: [createDemoAddTool()] });
 
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);

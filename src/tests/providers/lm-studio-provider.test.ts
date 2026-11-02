@@ -72,7 +72,7 @@ test("LM Studio provider omits authorization when no token is configured", async
   assert.equal(requestHeaders?.has("authorization"), false);
 });
 
-test("LM Studio provider streams text deltas from an OpenAI-compatible SSE response", async () => {
+test("LM Studio provider streams text deltas and returns the normalized final response", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const provider = new LmStudioProvider({
     endpoint,
@@ -88,14 +88,51 @@ test("LM Studio provider streams text deltas from an OpenAI-compatible SSE respo
   });
 
   const chunks: string[] = [];
-  for await (const delta of provider.streamText(request)) chunks.push(delta);
+  const result = await provider.generate(request, { onTextDelta: (delta) => { chunks.push(delta); } });
 
   assert.deepEqual(chunks, ["first ", "second"]);
+  assert.deepEqual(result, { kind: "final", text: "first second" });
   assert.deepEqual(requestBody, {
     model: "model-id",
     messages: request.messages,
     stream: true,
   });
+});
+
+test("LM Studio provider assembles one streamed tool call alongside tool definitions", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return sseResponse([
+        'data: {"choices":[{"delta":{"reasoning_content":"calculate","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"demo.","arguments":"{\\"a\\":"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"add","arguments":"2,\\"b\\":3}"}}]}}]}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    },
+  });
+  const tool = {
+    name: "demo.add",
+    description: "Adds numbers.",
+    inputSchema: { type: "object" },
+  };
+
+  const result = await provider.generate({ ...request, tools: [tool] }, { onTextDelta() {} });
+
+  assert.deepEqual(result, {
+    kind: "tool-call",
+    callId: "call-1",
+    name: "demo.add",
+    arguments: { a: 2, b: 3 },
+    reasoning: "calculate",
+  });
+  assert.equal(requestBody?.stream, true);
+  assert.deepEqual(requestBody?.tools, [{
+    type: "function",
+    function: { name: "demo.add", description: "Adds numbers.", parameters: { type: "object" } },
+  }]);
 });
 
 test("LM Studio provider yields a token before the upstream stream completes", async () => {
@@ -114,10 +151,12 @@ test("LM Studio provider yields a token before the upstream stream completes", a
     }), { status: 200, headers: { "content-type": "text/event-stream" } }),
   });
 
-  const iterator = provider.streamText(request)[Symbol.asyncIterator]();
-  assert.deepEqual(await iterator.next(), { value: "early", done: false });
+  let receiveEarly: ((value: string) => void) | undefined;
+  const early = new Promise<string>((resolve) => { receiveEarly = resolve; });
+  const generation = provider.generate(request, { onTextDelta: (delta) => { receiveEarly?.(delta); } });
+  assert.equal(await early, "early");
   releaseStream?.();
-  assert.deepEqual(await iterator.next(), { value: undefined, done: true });
+  assert.deepEqual(await generation, { kind: "final", text: "early" });
 });
 
 test("LM Studio provider rejects an interrupted SSE response without a done marker", async () => {
@@ -129,8 +168,8 @@ test("LM Studio provider rejects an interrupted SSE response without a done mark
 
   const chunks: string[] = [];
   await assert.rejects(
-    async () => { for await (const delta of provider.streamText(request)) chunks.push(delta); },
-    (error: unknown) => error instanceof LmStudioProviderError && error.message === "LM Studio text stream ended unexpectedly.",
+    provider.generate(request, { onTextDelta: (delta) => { chunks.push(delta); } }),
+    (error: unknown) => error instanceof LmStudioProviderError && error.message === "LM Studio chat completion stream ended unexpectedly.",
   );
   assert.deepEqual(chunks, ["partial"]);
 });
@@ -150,11 +189,15 @@ test("LM Studio provider propagates cancellation to the upstream stream", async 
       }), { status: 200, headers: { "content-type": "text/event-stream" } });
     },
   });
-  const iterator = provider.streamText(request, { signal: controller.signal })[Symbol.asyncIterator]();
-
-  assert.deepEqual(await iterator.next(), { value: "partial", done: false });
+  let receivePartial: (() => void) | undefined;
+  const partial = new Promise<void>((resolve) => { receivePartial = resolve; });
+  const generation = provider.generate(request, {
+    signal: controller.signal,
+    onTextDelta: () => { receivePartial?.(); },
+  });
+  await partial;
   controller.abort();
-  await assert.rejects(iterator.next(), (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+  await assert.rejects(generation, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
 });
 
 function sseResponse(chunks: readonly string[]): Response {

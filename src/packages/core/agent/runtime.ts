@@ -3,8 +3,9 @@ import type { AgentEventHandler, AgentRuntimeEvent } from "./events";
 import { AgentRuntimeError } from "./errors";
 import type {
   ModelMessage,
+  ModelGenerationOptions,
   ModelResponse,
-  StreamingTextGenerationProvider,
+  ModelTextDeltaHandler,
   TextGenerationProvider,
 } from "./model";
 import type { AgentTool, ToolCall, ToolPermissionPolicy } from "./tool";
@@ -19,11 +20,12 @@ export interface AgentRuntimeOptions {
   tools?: readonly AgentTool[];
   permissionPolicy?: ToolPermissionPolicy;
   onEvent?: AgentEventHandler;
+  onTextDelta?: ModelTextDeltaHandler;
+  signal?: AbortSignal;
 }
 
 export interface AgentTextStreamOptions extends AgentRuntimeOptions {
   onTextDelta(text: string): void | Promise<void>;
-  signal?: AbortSignal;
 }
 
 const MAX_MODEL_CALLS = 2;
@@ -41,21 +43,48 @@ export async function runAgentTurn(
   let toolExecutions = 0;
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
+    options.signal?.throwIfAborted();
     const callIndex = modelCall + 1;
+    let streamedText = "";
     await emitEvent(options.onEvent, { type: "model.started", callIndex });
     const response = await provider.generate({
       messages: [...conversation],
       tools: toolExecutions < MAX_TOOL_EXECUTIONS ? tools.map((tool) => tool.definition) : [],
-    });
+    }, {
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onTextDelta === undefined ? {} : {
+        onTextDelta: async (delta) => {
+          options.signal?.throwIfAborted();
+          if (typeof delta !== "string") {
+            throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid text chunk.");
+          }
+          if (delta.length === 0) return;
+          streamedText += delta;
+          await options.onTextDelta?.(delta);
+          await emitEvent(options.onEvent, { type: "assistant.delta", text: delta });
+        },
+      }),
+    } satisfies ModelGenerationOptions);
+    options.signal?.throwIfAborted();
 
     await collectReasoning(response, reasoningParts, callIndex, options.onEvent);
     if (response.kind === "final") {
       const result = createTurnResult(response, reasoningParts);
+      if (streamedText.length > 0 && streamedText !== result.text) {
+        throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "Streamed text did not match the final model response.");
+      }
+      if (options.onTextDelta !== undefined && streamedText.length === 0) {
+        await options.onTextDelta(result.text);
+        await emitEvent(options.onEvent, { type: "assistant.delta", text: result.text });
+      }
       await emitEvent(options.onEvent, { type: "model.completed", callIndex });
       return result;
     }
     if (response.kind !== "tool-call") {
       throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");
+    }
+    if (streamedText.length > 0) {
+      throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "A streamed model response cannot contain both text and a tool call.");
     }
 
     validateToolCallIdentity(response);
@@ -75,6 +104,7 @@ export async function runAgentTurn(
       name: response.name,
       arguments: response.arguments,
     };
+    options.signal?.throwIfAborted();
     const result = await executeToolCall(response, tools, options);
     appendToolExchange(conversation, toolCall, result);
     toolExecutions += 1;
@@ -85,38 +115,10 @@ export async function runAgentTurn(
 
 export async function streamAgentTurn(
   messages: readonly Message[],
-  provider: StreamingTextGenerationProvider,
+  provider: TextGenerationProvider,
   options: AgentTextStreamOptions,
 ): Promise<AgentTurnResult> {
-  if ((options.tools?.length ?? 0) > 0) {
-    throw new AgentRuntimeError("INVALID_CONFIGURATION", "Streaming turns do not support tools.");
-  }
-  validateConfiguration(options);
-  options.signal?.throwIfAborted();
-
-  const conversation = createModelConversation(messages);
-  const textParts: string[] = [];
-  await emitEvent(options.onEvent, { type: "model.started", callIndex: 1 });
-  for await (const delta of provider.streamText({ messages: conversation, tools: [] }, {
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
-  })) {
-    options.signal?.throwIfAborted();
-    if (typeof delta !== "string") {
-      throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid text chunk.");
-    }
-    if (delta.length === 0) continue;
-    textParts.push(delta);
-    await options.onTextDelta(delta);
-    await emitEvent(options.onEvent, { type: "assistant.delta", text: delta });
-  }
-  options.signal?.throwIfAborted();
-
-  const text = textParts.join("");
-  if (text.length === 0) {
-    throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an empty response.");
-  }
-  await emitEvent(options.onEvent, { type: "model.completed", callIndex: 1 });
-  return { text };
+  return runAgentTurn(messages, provider, options);
 }
 
 function validateConfiguration(options: AgentRuntimeOptions): readonly AgentTool[] {
@@ -215,24 +217,33 @@ async function executeToolCall(
   }
 
   let permission: "allow" | "deny";
+  options.signal?.throwIfAborted();
   try {
     permission = await options.permissionPolicy!.authorize({
       sessionId: options.sessionId,
       toolName: response.name,
       input: response.arguments,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
   } catch {
+    options.signal?.throwIfAborted();
     throw new AgentRuntimeError("PERMISSION_CHECK_FAILED", "The tool permission check failed.");
   }
+  options.signal?.throwIfAborted();
   if (permission !== "allow") {
     throw new AgentRuntimeError("PERMISSION_DENIED", "The tool call was denied.");
   }
 
+  options.signal?.throwIfAborted();
   await emitEvent(options.onEvent, { type: "tool.started", callId: response.callId, name: response.name });
   let result: string;
   try {
-    result = await tool.execute(response.arguments, { sessionId: options.sessionId });
+    result = await tool.execute(response.arguments, {
+      sessionId: options.sessionId,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
   } catch (cause) {
+    options.signal?.throwIfAborted();
     throw new AgentRuntimeError("TOOL_EXECUTION_FAILED", "Tool execution failed.", { cause });
   }
   if (typeof result !== "string") {

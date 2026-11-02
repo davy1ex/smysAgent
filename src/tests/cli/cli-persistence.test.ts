@@ -244,6 +244,75 @@ test("CLI fake smoke explicitly enables and permits demo.add", async (t) => {
   assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
 });
 
+test("CLI exposes the shared turn as text streaming and NDJSON without changing --json", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-stream-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+
+  const textSessionProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(textSessionProcess.status, 0, textSessionProcess.stderr);
+  const textSession = JSON.parse(textSessionProcess.stdout) as { session: { id: string } };
+  const textStream = await runCliAsync(dataDir, [
+    "agent", "run", "--stream", "--provider", "fake", "--session-id", textSession.session.id, "--text", "streamed input",
+  ]);
+  assert.equal(textStream.status, 0, textStream.stderr);
+  assert.equal(textStream.stdout, "Fake response to: streamed input\n");
+
+  const toolSessionProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(toolSessionProcess.status, 0, toolSessionProcess.stderr);
+  const toolSession = JSON.parse(toolSessionProcess.stdout) as { session: { id: string } };
+  const ndjsonStream = await runCliAsync(dataDir, [
+    "agent", "run", "--stream", "--output", "ndjson", "--provider", "fake",
+    "--session-id", toolSession.session.id, "--text", "stream demo.add", "--tool", "demo.add", "--allow-tool", "demo.add",
+  ]);
+  assert.equal(ndjsonStream.status, 0, ndjsonStream.stderr);
+  const events = ndjsonStream.stdout.trim().split("\n").map((line) => JSON.parse(line) as { type: string; text?: string; assistantMessage?: { content: Array<{ text: string }> } });
+  assert.ok(events.some((event) => event.type === "tool.completed"));
+  assert.equal(events.filter((event) => event.type === "assistant.delta").map((event) => event.text).join(""), "Fake demo.add result: 5");
+  const completed = events.find((event) => event.type === "turn.completed");
+  assert.equal(completed?.assistantMessage?.content[0]?.text, "Fake demo.add result: 5");
+
+  const jsonConflict = runCli(dataDir, [
+    "agent", "run", "--json", "--stream", "--provider", "fake", "--session-id", toolSession.session.id, "--text", "invalid combination",
+  ]);
+  assert.equal(jsonConflict.status, 2);
+  assert.equal((JSON.parse(jsonConflict.stderr) as { error: { code: string } }).error.code, "INVALID_ARGUMENT");
+});
+
+test("CLI SIGINT cancels generation and leaves no partial assistant message", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-cancel-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const createdProcess = runCli(dataDir, ["session", "create", "--json"]);
+  assert.equal(createdProcess.status, 0, createdProcess.stderr);
+  const created = JSON.parse(createdProcess.stdout) as { session: { id: string } };
+  const child = spawn(process.execPath, [
+    cliPath,
+    "agent", "run", "--stream", "--provider", "fake", "--session-id", created.session.id, "--text", "cancel this generation",
+    "--data-dir", dataDir,
+  ], { env: childEnvironment({}) });
+  let stdout = "";
+  let stderr = "";
+  let interrupted = false;
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    stdout += chunk;
+    if (!interrupted && stdout.trim().length > 0) {
+      interrupted = true;
+      child.kill("SIGINT");
+    }
+  });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+  const status = await new Promise<number | null>((resolveProcess, rejectProcess) => {
+    child.once("error", rejectProcess);
+    child.once("close", resolveProcess);
+  });
+
+  assert.equal(interrupted, true);
+  assert.equal(status, 130);
+  assert.match(stderr, /ABORTED: Turn was cancelled\./);
+  const historyProcess = runCli(dataDir, ["history", "get", "--json", "--session-id", created.session.id]);
+  const history = JSON.parse(historyProcess.stdout) as { messages: Array<{ role: string }> };
+  assert.deepEqual(history.messages.map((message) => message.role), ["user"]);
+});
+
 test("LM Studio CLI turns persist and a separate history process reads them", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-lm-studio-"));
   t.after(async () => rm(dataDir, { recursive: true, force: true }));

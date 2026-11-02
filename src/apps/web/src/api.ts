@@ -28,11 +28,13 @@ export interface AgentTurn {
   runId: string;
   userMessage: SessionMessage;
   assistantMessage: SessionMessage;
+  reasoning?: string;
 }
 
 export interface AgentTurnStreamHandlers {
   onStarted(runId: string, userMessage: SessionMessage): void;
   onTextDelta(text: string): void;
+  onRuntimeEvent?(event: string, payload: Record<string, unknown>): void;
 }
 
 export class WebApiError extends Error {
@@ -65,11 +67,11 @@ export async function fetchHistory(sessionId: string): Promise<SessionHistory> {
   return request<SessionHistory>(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
 }
 
-export async function sendMessage(sessionId: string, text: string): Promise<AgentTurn> {
+export async function sendMessage(sessionId: string, text: string, allowTools: readonly string[] = []): Promise<AgentTurn> {
   return request<AgentTurn>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, ...(allowTools.length === 0 ? {} : { allowTools }) }),
   });
 }
 
@@ -78,13 +80,14 @@ export async function sendMessageStream(
   text: string,
   handlers: AgentTurnStreamHandlers,
   signal?: AbortSignal,
+  allowTools: readonly string[] = [],
 ): Promise<AgentTurn> {
   let response: Response;
   try {
     response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages/stream`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "text/event-stream" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, ...(allowTools.length === 0 ? {} : { allowTools }) }),
       ...(signal === undefined ? {} : { signal }),
     });
   } catch {
@@ -127,7 +130,12 @@ export async function sendMessageStream(
             throw new WebApiError("SMYS host завершил ход без события начала.", "INVALID_RESPONSE", runId, turnId);
           }
           void reader.cancel().catch(() => undefined);
-          return { runId: result.runId, userMessage, assistantMessage: result.assistantMessage };
+          return {
+            runId: result.runId,
+            userMessage,
+            assistantMessage: result.assistantMessage,
+            ...(result.reasoning === undefined ? {} : { reasoning: result.reasoning }),
+          };
         }
         boundary = findEventBoundary(buffer);
       }
@@ -177,7 +185,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 type ParsedStreamEvent =
   | { type: "started"; runId: string; userMessage: SessionMessage }
   | { type: "delta" }
-  | { type: "completed"; runId: string; assistantMessage: SessionMessage }
+  | { type: "completed"; runId: string; assistantMessage: SessionMessage; reasoning?: string }
   | { type: "ignored" };
 
 function processStreamEvent(frame: string, handlers: AgentTurnStreamHandlers): ParsedStreamEvent {
@@ -225,7 +233,16 @@ function processStreamEvent(frame: string, handlers: AgentTurnStreamHandlers): P
     if (typeof payload.runId !== "string" || !isSessionMessage(payload.assistantMessage) || payload.assistantMessage.role !== "assistant") {
       throw new WebApiError("SMYS host передал некорректное событие завершения хода.", "INVALID_RESPONSE");
     }
-    return { type: "completed", runId: payload.runId, assistantMessage: payload.assistantMessage };
+    return {
+      type: "completed",
+      runId: payload.runId,
+      assistantMessage: payload.assistantMessage,
+      ...(typeof payload.reasoning === "string" ? { reasoning: payload.reasoning } : {}),
+    };
+  }
+  if (["model.started", "model.completed", "reasoning.completed", "tool.requested", "tool.started", "tool.completed"].includes(eventName)) {
+    handlers.onRuntimeEvent?.(eventName, payload);
+    return { type: "ignored" };
   }
   return { type: "ignored" };
 }
