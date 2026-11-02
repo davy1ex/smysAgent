@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { createDemoAddTool, type TextGenerationProvider } from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 import { LmStudioProvider } from "../../packages/providers/lm-studio-provider";
-import { JsonFileSessionRepository } from "../../packages/storage";
+import { SqliteApplicationRepository } from "../../packages/storage";
 import { createWebApiServer } from "./server";
 
 const DEFAULT_LM_STUDIO_ENDPOINT = "http://localhost:1234/v1/chat/completions";
@@ -11,7 +11,7 @@ const DEFAULT_PORT = 3001;
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const port = resolvePort(env.SMYS_WEB_PORT);
   const dataDir = resolve(process.cwd(), env.SMYS_DATA_DIR || ".smys-agent");
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   const server = createWebApiServer({ repository, provider: resolveProvider(env), tools: [createDemoAddTool()] });
 
   await new Promise<void>((resolveListen, rejectListen) => {

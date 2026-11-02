@@ -5,14 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LmStudioProvider } from "../../packages/providers/lm-studio-provider";
-import { JsonFileSessionRepository } from "../../packages/storage";
+import { SqliteApplicationRepository } from "../../packages/storage";
 import { createWebApiServer } from "../../apps/web-host/server";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 import { createDemoAddTool } from "../../packages/application";
 
 test("local Web API creates sessions, runs a fake turn, and returns persisted history", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   const server = createWebApiServer({ repository, provider: new FakeProvider() });
 
   try {
@@ -68,9 +68,67 @@ test("local Web API creates sessions, runs a fake turn, and returns persisted hi
   }
 });
 
+test("completed reasoning is available to independent clients after the Web Host restarts", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-restart-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const firstRepository = new SqliteApplicationRepository(dataDir);
+  const firstServer = createWebApiServer({
+    repository: firstRepository,
+    provider: new FakeProvider([{ kind: "final", text: "persistent answer", reasoning: "line one\nline two" }]),
+  });
+  let sessionId = "";
+
+  try {
+    const baseUrl = await listen(firstServer);
+    sessionId = (await createWebSession(baseUrl)).sessionId;
+    const response = await fetch(baseUrl + "/api/sessions/" + sessionId + "/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "persist this turn" }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { assistantMessage: { content: Array<{ text: string }> } })
+      .assistantMessage.content[0]?.text, "persistent answer");
+  } finally {
+    await close(firstServer);
+    await firstRepository.close();
+  }
+
+  const reopenedRepository = new SqliteApplicationRepository(dataDir);
+  const reopenedServer = createWebApiServer({ repository: reopenedRepository, provider: new FakeProvider() });
+  try {
+    const baseUrl = await listen(reopenedServer);
+    const [clientOne, clientTwo] = await Promise.all([
+      fetch(baseUrl + "/api/sessions/" + sessionId + "/history").then((result) => result.json()),
+      fetch(baseUrl + "/api/sessions/" + sessionId + "/history").then((result) => result.json()),
+    ]) as [{
+      messages: Array<{ role: string; content: Array<{ text: string }> }>;
+      runs: Array<{ id: string; userMessageId: string; assistantMessageId: string; steps: Array<{ type: string; text?: string }> }>;
+    }, {
+      messages: Array<{ role: string; content: Array<{ text: string }> }>;
+      runs: Array<{ id: string; userMessageId: string; assistantMessageId: string; steps: Array<{ type: string; text?: string }> }>;
+    }];
+    for (const history of [clientOne, clientTwo]) {
+      assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
+        ["user", "persist this turn"],
+        ["assistant", "persistent answer"],
+      ]);
+      assert.equal(history.runs.length, 1);
+      assert.equal(history.runs[0]?.steps.filter((step) => step.type === "reasoning").length, 1);
+      assert.equal(history.runs[0]?.steps[1]?.text, "line one\nline two");
+      assert.equal(history.runs[0]?.userMessageId.length, 36);
+      assert.equal(history.runs[0]?.assistantMessageId.length, 36);
+    }
+    assert.deepEqual(clientOne, clientTwo);
+  } finally {
+    await close(reopenedServer);
+    await reopenedRepository.close();
+  }
+});
+
 test("failed provider turn returns its run and message identifiers without losing the user message", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-failure-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   const provider = new LmStudioProvider({
     endpoint: "http://127.0.0.1:1234/v1/chat/completions",
     model: "test-model",
@@ -117,7 +175,7 @@ test("failed provider turn returns its run and message identifiers without losin
 
 test("local Web API runs a turn through the configured LM Studio provider", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-lm-studio-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   let providerRequest: { model?: string; stream?: boolean } | undefined;
   const provider = new LmStudioProvider({
     endpoint: "http://127.0.0.1:1234/v1/chat/completions",
@@ -159,7 +217,7 @@ test("local Web API runs a turn through the configured LM Studio provider", asyn
 
 test("streaming Web API delivers deltas before model completion and persists once before completed", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   let releaseModel: (() => void) | undefined;
   const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
   const provider = {
@@ -221,7 +279,7 @@ test("streaming Web API delivers deltas before model completion and persists onc
 
 test("streaming Web API reports provider failure without persisting partial assistant text", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-failure-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   const provider = new LmStudioProvider({
     endpoint: "http://127.0.0.1:1234/v1/chat/completions",
     model: "test-model",
@@ -262,7 +320,7 @@ test("streaming Web API reports provider failure without persisting partial assi
 
 test("Web SSE executes demo.add only for a tool explicitly allowed on this turn", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-demo-add-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   const provider = new FakeProvider([
     { kind: "tool-call", callId: "web-demo-add", name: "demo.add", arguments: { a: 2, b: 3 } },
     { kind: "final", text: "Fake demo.add result: 5", reasoning: "Use the sum returned by the tool." },
@@ -315,21 +373,22 @@ test("Web SSE executes demo.add only for a tool explicitly allowed on this turn"
       reasoning?: string;
     };
     assert.equal(completed.assistantMessage.content[0]?.text, "Fake demo.add result: 5");
-    assert.deepEqual(completed.assistantMessage.reasoning, [
-      { callIndex: 2, text: "Use the sum returned by the tool." },
-    ]);
+    assert.equal(completed.assistantMessage.reasoning, undefined);
     assert.equal(completed.reasoning, "Use the sum returned by the tool.");
 
     const history = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
       messages: Array<{ role: string; content: Array<{ text: string }>; reasoning?: Array<{ callIndex: number; text: string }> }>;
+      runs: Array<{ steps: Array<{ type: string; callIndex: number; text?: string; callId?: string; result?: string }> }>;
     };
     assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
       ["user", "add 2 and 3"],
       ["assistant", "Fake demo.add result: 5"],
     ]);
-    assert.deepEqual(history.messages[1]?.reasoning, [
-      { callIndex: 2, text: "Use the sum returned by the tool." },
-    ]);
+    assert.deepEqual(history.runs[0]?.steps.map((step) => step.type), ["model", "tool", "model", "reasoning"]);
+    assert.equal(history.runs[0]?.steps[1]?.callId, "web-demo-add");
+    assert.equal(history.runs[0]?.steps[1]?.result, "5");
+    assert.equal(history.runs[0]?.steps[3]?.text, "Use the sum returned by the tool.");
+    assert.equal(history.messages[1]?.reasoning, undefined);
   } finally {
     await close(server);
     await repository.close();
@@ -339,7 +398,7 @@ test("Web SSE executes demo.add only for a tool explicitly allowed on this turn"
 
 test("Web SSE does not auto-allow a registered tool when the turn has no explicit grant", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-demo-add-denied-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   let executions = 0;
   const tool = createDemoAddTool();
   const provider = new FakeProvider([
@@ -383,7 +442,7 @@ test("Web SSE does not auto-allow a registered tool when the turn has no explici
 
 test("disconnecting a streaming Web request aborts provider generation", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-web-api-stream-abort-"));
-  const repository = new JsonFileSessionRepository(dataDir);
+  const repository = new SqliteApplicationRepository(dataDir);
   let resolveCancelled: (() => void) | undefined;
   const cancelled = new Promise<void>((resolve) => { resolveCancelled = resolve; });
   const provider = {

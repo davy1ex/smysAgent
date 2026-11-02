@@ -7,7 +7,7 @@ import {
 } from "../core/agent";
 import type { AssistantMessage, AssistantReasoning, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
-import type { AgentExecutionOptions, SessionRepository } from "./ports";
+import type { AgentExecutionOptions, AgentRunStep, ApplicationRepository, CompletedAgentRun, SessionRepository } from "./ports";
 
 export async function createSession(repository: SessionRepository): Promise<Session> {
   const session: Session = {
@@ -65,7 +65,7 @@ export async function sendMessage(
 }
 
 export async function executeTurn(
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   provider: TextGenerationProvider,
   input: { sessionId: SessionId; text: string; runId?: string },
   agentOptions: AgentExecutionOptions = {},
@@ -78,14 +78,46 @@ export async function executeTurn(
   let assistantMessage: AssistantMessage;
   let reasoning: string | undefined;
   const reasoningByCall: AssistantReasoning[] = [];
+  const steps: AgentRunStep[] = [];
+  let activeCallIndex = 0;
+  let pendingTool: Extract<AgentRunStep, { type: "tool" }> | undefined;
+  const startedAt = new Date().toISOString();
   agentOptions.signal?.throwIfAborted();
   try {
     userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
     await agentOptions.onEvent?.({ type: "turn.started", runId, userMessage });
     const history = await getHistory(repository, input.sessionId);
     const onRuntimeEvent = async (event: AgentEvent): Promise<void> => {
-      if (event.type === "reasoning.completed") {
-        reasoningByCall.push({ callIndex: event.callIndex, text: event.text });
+      switch (event.type) {
+        case "model.started":
+          activeCallIndex = event.callIndex;
+          steps.push({ type: "model", callIndex: event.callIndex, phase: "waiting" });
+          break;
+        case "assistant.delta": {
+          const modelStep = [...steps].reverse().find((step) => step.type === "model" && step.callIndex === activeCallIndex);
+          if (modelStep?.type === "model") modelStep.phase = "generating";
+          break;
+        }
+        case "reasoning.completed":
+          reasoningByCall.push({ callIndex: event.callIndex, text: event.text });
+          steps.push({ type: "reasoning", callIndex: event.callIndex, text: event.text });
+          break;
+        case "tool.requested":
+          pendingTool = {
+            type: "tool",
+            callIndex: activeCallIndex,
+            callId: event.callId,
+            name: event.name,
+            arguments: event.arguments,
+            result: "",
+          };
+          break;
+        case "tool.completed":
+          if (pendingTool?.callId === event.callId) {
+            steps.push({ ...pendingTool, result: event.result });
+            pendingTool = undefined;
+          }
+          break;
       }
       await agentOptions.onEvent?.(event);
     };
@@ -95,11 +127,23 @@ export async function executeTurn(
       onEvent: onRuntimeEvent,
     });
     reasoning = result.reasoning;
-    const savedAssistantMessage = await repository.appendAssistantMessage(input.sessionId, {
+    const assistantMessageDraft = {
       id: randomUUID(),
       createdAt: new Date().toISOString(),
       text: result.text,
-      ...(reasoningByCall.length === 0 ? {} : { reasoning: reasoningByCall }),
+    };
+    const savedAssistantMessage = await repository.completeRun({
+      run: {
+        id: runId,
+        sessionId: input.sessionId,
+        userMessageId: userMessage.id,
+        assistantMessageId: assistantMessageDraft.id,
+        status: "completed",
+        startedAt,
+        completedAt: new Date().toISOString(),
+        steps,
+      },
+      assistantMessage: assistantMessageDraft,
     });
     if (savedAssistantMessage === null) {
       throw new SessionNotFoundError(input.sessionId);
@@ -125,7 +169,7 @@ export async function executeTurn(
 }
 
 export async function runAgentTurn(
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   provider: TextGenerationProvider,
   input: { sessionId: SessionId; text: string; runId?: string },
   agentOptions: AgentExecutionOptions = {},
@@ -140,7 +184,7 @@ export interface AgentTurnStreamHandlers {
 }
 
 export async function runAgentTurnStreaming(
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   provider: TextGenerationProvider,
   input: { sessionId: SessionId; text: string; runId?: string },
   handlers: AgentTurnStreamHandlers,
@@ -198,4 +242,17 @@ export async function getHistory(
     throw new SessionNotFoundError(sessionId);
   }
   return history;
+}
+
+export interface SessionTrajectory extends SessionHistory {
+  runs: CompletedAgentRun[];
+}
+
+export async function getSessionTrajectory(
+  repository: ApplicationRepository,
+  sessionId: SessionId,
+): Promise<SessionTrajectory> {
+  const history = await getHistory(repository, sessionId);
+  const runs = await repository.listCompletedRuns(sessionId);
+  return { ...history, runs };
 }

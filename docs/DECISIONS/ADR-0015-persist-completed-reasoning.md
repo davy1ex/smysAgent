@@ -1,10 +1,13 @@
 # ADR-0015: Сохранение reasoning завершённых ходов
 
-- Статус: Accepted
+- Статус: Superseded
+- Заменён: [ADR-0016](./ADR-0016-sqlite-completed-runs.md)
 - Дата: 2026-11-02
 - Утвердил: владелец проекта в чате
 
 ## Контекст
+
+> Историческое решение для JSON store v3. completed run persistence расширено и заменено ADR-0016; поле reasoning сохраняется для чтения legacy сообщений.
 
 `reasoning.delta` и `reasoning.completed` отображаются во время inference, но история JSON store сохраняет только текст user/assistant messages. После reload Web получает финальные ответы без trajectory, поэтому reasoning завершённых ходов пропадает. Владелец утвердил backend-owned сохранение completed reasoning и отклонил `sessionStorage`.
 

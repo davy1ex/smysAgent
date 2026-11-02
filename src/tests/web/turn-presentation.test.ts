@@ -7,6 +7,7 @@ import {
   failTurn,
   getReasoningPreview,
   markAssistantDelta,
+  restoreCompletedRun,
   restoreCompletedReasoning,
 } from "../../apps/web-ui/turn-presentation";
 import { FakeProvider } from "../../packages/providers/fake-provider";
@@ -77,6 +78,27 @@ test("history restores completed reasoning blocks in model-call order", () => {
   ]);
   assert.equal(restoreCompletedReasoning(undefined), undefined);
   assert.equal(restoreCompletedReasoning([]), undefined);
+});
+
+test("completed run restoration preserves persisted model, reasoning, and tool order", () => {
+  const restored = restoreCompletedRun([
+    { type: "model", callIndex: 1, phase: "waiting" },
+    { type: "reasoning", callIndex: 1, text: "Prepare tool.\nFull text." },
+    { type: "tool", callIndex: 1, callId: "call-1", name: "demo.add", arguments: { a: 2, b: 3 }, result: "5" },
+    { type: "model", callIndex: 2, phase: "generating" },
+    { type: "reasoning", callIndex: 2, text: "Use result." },
+  ], "2026-11-02T08:00:00.000Z", "2026-11-02T08:00:05.000Z");
+
+  assert.equal(restored?.status, "completed");
+  assert.equal(restored?.durationMs, 5000);
+  assert.deepEqual(restored?.steps.map((step) => step.type), ["model", "reasoning", "tool", "model", "reasoning"]);
+  assert.deepEqual(restored?.steps[1], {
+    type: "reasoning", callIndex: 1, text: "Prepare tool.\nFull text.", status: "completed",
+  });
+  assert.deepEqual(restored?.steps[2], {
+    type: "tool", callIndex: 1, callId: "call-1", name: "demo.add", arguments: { a: 2, b: 3 },
+    result: "5", status: "completed",
+  });
 });
 
 test("turn presentation shows ordered reasoning deltas before content and reconciles completion without duplication", () => {

@@ -2,9 +2,9 @@
 
 **UX-требования:** `Accepted` владельцем 2026-11-02.
 
-**Текущее поведение:** Stage A, Live Reasoning Streaming (Stage B), backend persistence reasoning завершённых ходов и безопасный Web Markdown `Implemented` по тестам; live streaming ранее проверен на LM Studio.
+**Текущее поведение:** Stage A, Live Reasoning Streaming (Stage B), SQLite persistence completed AgentRun traces, Web recovery и безопасный Markdown `Implemented` по тестам; live streaming ранее проверен на LM Studio.
 
-**Технические решения:** контракты `reasoning.delta`, Web Markdown и persistence completed reasoning приняты в [ADR-0013](../DECISIONS/ADR-0013-live-reasoning-deltas.md), [ADR-0014](../DECISIONS/ADR-0014-safe-markdown-web.md) и [ADR-0015](../DECISIONS/ADR-0015-persist-completed-reasoning.md). Active run recovery, replay, resource locks и SQLite в этой задаче не входят.
+**Технические решения:** контракты `reasoning.delta`, Web Markdown и persistence completed AgentRun traces приняты в [ADR-0013](../DECISIONS/ADR-0013-live-reasoning-deltas.md), [ADR-0014](../DECISIONS/ADR-0014-safe-markdown-web.md) и [ADR-0016](../DECISIONS/ADR-0016-sqlite-completed-runs.md). Active run recovery, replay и inference resource locks не входят.
 
 ## Цель
 
@@ -18,24 +18,24 @@ Web показывает фактическое развитие agent turn во
 - Provider, возвращающий reasoning только итоговым полем, создаёт block при получении этого поля. При отсутствии reasoning UI показывает только фактический нейтральный статус model call.
 - Fake Provider выдаёт delayed reasoning chunks до assistant content. Первый фактический `assistant.delta` помечает reasoning активного model call завершённым и переключает строку на `Анализ завершён`; последующие assistant deltas не меняют текст reasoning. `reasoning.completed` остаётся canonical источником полного текста и сверяет накопленные chunks без дублей. Draft постепенно заменяется одним финальным сообщением после `turn.completed`.
 - Финальный и потоковый assistant text рендерятся `react-markdown` + `remark-gfm`. Raw HTML выключен, небезопасные URL schemes не становятся активными ссылками; безопасная обработка не использует `dangerouslySetInnerHTML` или raw HTML plugin.
-- При успешном завершении Application сохраняет per-call записи reasoning на assistant message. JSON store v3 мигрирует v1/v2 на первой записи с сохранением исходного файла в versioned backup; history API возвращает поле, а React восстанавливает свёрнутые блоки после reload. sessionStorage не используется.
+- При успешном завершении Application атомарно сохраняет assistant message и отдельный AgentRun со стабильными ссылками на user/assistant messages. Ordered steps включают model calls, полный canonical reasoning по каждому callIndex и tool name/arguments/result. Assistant text не дублируется в trace; `reasoning.delta` не сохраняется.
+- Web history API возвращает messages и completed runs одним ответом. React связывает runs с assistant messages по ID и восстанавливает timeline в исходном порядке; legacy `assistantMessage.reasoning` остаётся fallback. JSON v1/v2/v3 импортируется в SQLite один раз с точной backup копией. `sessionStorage` не используется.
 - Runtime events, partial reasoning ошибочных/отменённых ходов, UI draft и active inference не сохраняются и не восстанавливаются.
 
 ## Evidence и проверки
 
-Изменения проверены в Core/Application, provider adapters, JSON storage, Web Host/API, `src/apps/web-ui/turn-presentation.ts` и Web UI; решение о completed reasoning persistence описано в ADR-0015.
+Изменения проверяются в Application, SQLite storage, Web Host/API, `src/apps/web-ui/turn-presentation.ts`, Web UI и CLI; completed-run решение описано в ADR-0016. Core Runtime, provider adapters и streaming UX не менялись.
 
 - `npm test`: 71 root tests passed; Web Markdown suite: 3 passed.
 - `npm run typecheck`, `npm run lint` и `src/apps/web` `npm run build` прошли.
-- Тесты проверяют delayed provider chunks, upstream порядок reasoning/content, SSE per-call events, постепенное состояние UI, длинный текст, несколько model calls, reconciliation без дублей, whole-text reasoning fallback, отсутствие reasoning, persistence после повторного открытия JSON store, миграции v1/v2 → v3 и сохранение backup, history API, восстановление UI из истории, cancellation/error state, Markdown/GFM, incremental streaming, raw HTML и небезопасные ссылки.
-- Browser reload после этой persistence-правки вручную не проверен: канал управления браузером завершился с `Transport closed`. Повторное открытие JSON store и восстановление UI state отдельно покрыты storage, Web API и presentation тестами.
+- Тесты проверяют canonical reasoning без дублей, несколько model calls, полный tool payload и порядок, SQLite reopen, импорт JSON v1/v2/v3 с exact backups, atomic run/message write, Web Host restart, два независимых history clients, UI trace restoration и сессию без trace.
 - Ручной браузерный прогон с `qwen3.8-9b-mlx` подтвердил в одном ходе: `reasoning_content` `2026-11-02T07:32:11.346Z`; `reasoning.delta` SSE `07:32:11.347Z`; первый DOM render reasoning при пустом content `07:32:11.473Z`; первый upstream content `07:32:26.876Z`; `assistant.delta` SSE `07:32:26.885Z`; первый DOM render assistant content `07:32:27.180Z`. DOM polling interval — до 250 мс.
 - UI tests проверяют preview после каждого заданного `reasoning.delta`, рост текущей строки, reset на переносе, пустые строки, несколько переносов в одном чанке, CRLF, длинную строку, полный source text, completed preview и независимость model calls. Ручной браузерный прогон на delayed Fake Provider с настоящими `\r\n` и `\n` подтвердил переключение между строками, свёрнутое состояние во время стрима, раскрытие полного текста с исходными переносами и последнюю непустую строку после завершения.
 
 ## Границы и открытые задачи
 
 - Completed reasoning сохраняется backend и доступен после Cmd+R. Reload во время active inference по-прежнему отменяет provider request при закрытии SSE; draft и активный ход не восстанавливаются. Для этого нужны отдельные backend status/snapshot/replay и reconnect contracts.
-- SQLite, durable trajectory, cross-process inference resource locks и второй agent loop не реализуются этим spec/патчем.
+- Active run state, replay/reconnect, cross-process inference resource locks и второй agent loop не реализуются этим spec/патчем.
 - Аудит диагностических ошибок записан в [`NOW.md`](../NOW.md): `ECONNRESET` теряет исходную причину в provider catch и приходит в Web как generic `PROVIDER_ERROR`. Улучшение диагностики — отдельная задача.
 
 ## Принятые критерии Live Inference UX

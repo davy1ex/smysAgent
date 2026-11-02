@@ -8,12 +8,26 @@ import {
   type ToolPermissionPolicy,
 } from "../../packages/core/agent";
 import type { AssistantMessage, Message, Session, SessionHistory, SessionId, UserMessage } from "../../packages/core/session";
-import { createSession, getHistory, listSessions, runAgentTurn, runAgentTurnStreaming, sendMessage, SessionNotFoundError, type SessionRepository, type UserMessageDraft } from "../../packages/application";
+import {
+  createSession,
+  getHistory,
+  getSessionTrajectory,
+  listSessions,
+  runAgentTurn,
+  runAgentTurnStreaming,
+  sendMessage,
+  SessionNotFoundError,
+  type AgentRunRepository,
+  type CompletedAgentRun,
+  type SessionRepository,
+  type UserMessageDraft,
+} from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 
-class MemorySessionRepository implements SessionRepository {
+class MemorySessionRepository implements SessionRepository, AgentRunRepository {
   private readonly sessions = new Map<SessionId, Session>();
   private readonly messages: Message[] = [];
+  private readonly runs: CompletedAgentRun[] = [];
 
   async createSession(session: Session): Promise<void> {
     this.sessions.set(session.id, session);
@@ -64,6 +78,19 @@ class MemorySessionRepository implements SessionRepository {
     };
     this.messages.push(message);
     return message;
+  }
+
+  async completeRun(input: { run: CompletedAgentRun; assistantMessage: { id: string; createdAt: string; text: string } }): Promise<AssistantMessage | null> {
+    const user = this.messages.find((message) => message.id === input.run.userMessageId && message.role === "user");
+    if (user === undefined || user.sessionId !== input.run.sessionId) return null;
+    const message = await this.appendAssistantMessage(input.run.sessionId, input.assistantMessage);
+    if (message === null) return null;
+    this.runs.push(structuredClone(input.run));
+    return message;
+  }
+
+  async listCompletedRuns(sessionId: SessionId): Promise<CompletedAgentRun[]> {
+    return structuredClone(this.runs.filter((run) => run.sessionId === sessionId));
   }
 
   async getHistory(sessionId: SessionId): Promise<SessionHistory | null> {
@@ -138,6 +165,7 @@ test("application API runs one provider turn and persists ordered user and assis
   assert.equal(turn.assistantMessage.role, "assistant");
   assert.equal(turn.assistantMessage.sequence, 2);
   assert.equal(turn.reasoning, "deterministic reasoning");
+  assert.equal(turn.assistantMessage.reasoning, undefined);
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0].text]), [
     ["user", "hello"],
     ["assistant", "deterministic reply"],
@@ -198,8 +226,10 @@ test("application streaming turn forwards deltas and persists their final text o
     ["user", "hello"],
     ["assistant", "streamed reply"],
   ]);
-  assert.deepEqual(history.messages[1]?.role === "assistant" ? history.messages[1].reasoning : undefined, [
-    { callIndex: 1, text: "reasoning arrived first" },
+  const trajectory = await getSessionTrajectory(repository, session.id);
+  assert.deepEqual(trajectory.runs[0]?.steps, [
+    { type: "model", callIndex: 1, phase: "generating" },
+    { type: "reasoning", callIndex: 1, text: "reasoning arrived first" },
   ]);
 });
 
@@ -329,6 +359,16 @@ test("application API executes one permitted tool and persists only the final an
     ["user", "use the test tool"],
     ["assistant", "The tool returned: from tool"],
   ]);
+  const trajectory = await getSessionTrajectory(repository, session.id);
+  assert.deepEqual(trajectory.runs[0]?.steps.map((step) => step.type), ["model", "reasoning", "tool", "model", "reasoning"]);
+  assert.deepEqual(trajectory.runs[0]?.steps[2], {
+    type: "tool",
+    callIndex: 1,
+    callId: "call-1",
+    name: "test.echo",
+    arguments: { text: "from tool" },
+    result: "from tool",
+  });
 });
 
 test("the shared application turn streams its final answer after a permitted tool call", async () => {
@@ -397,26 +437,23 @@ test("application emits ordered per-call reasoning and tool events around persis
       async onEvent(event) {
         events.push(event);
         if (event.type === "turn.completed") {
-          const history = await getHistory(repository, session.id);
-          assert.equal(history.messages.at(-1)?.role, "assistant");
-          const assistant = history.messages.at(-1);
-          assert.deepEqual(
-            assistant?.role === "assistant" ? assistant.reasoning : undefined,
-            [
-              { callIndex: 1, text: "Prepare the tool call." },
-              { callIndex: 2, text: "Use the tool result." },
-            ],
-          );
+          const trajectory = await getSessionTrajectory(repository, session.id);
+          assert.equal(trajectory.messages.at(-1)?.role, "assistant");
+          assert.deepEqual(trajectory.runs[0]?.steps.filter((step) => step.type === "reasoning"), [
+            { type: "reasoning", callIndex: 1, text: "Prepare the tool call." },
+            { type: "reasoning", callIndex: 2, text: "Use the tool result." },
+          ]);
         }
       },
     },
   );
 
   assert.equal(turn.reasoning, "Prepare the tool call.\n\nUse the tool result.");
-  assert.deepEqual(turn.assistantMessage.reasoning, [
-    { callIndex: 1, text: "Prepare the tool call." },
-    { callIndex: 2, text: "Use the tool result." },
-  ]);
+  assert.equal(turn.assistantMessage.reasoning, undefined);
+  const trajectory = await getSessionTrajectory(repository, session.id);
+  assert.equal(trajectory.runs[0]?.id, "run-1");
+  assert.equal(trajectory.runs[0]?.userMessageId, turn.userMessage.id);
+  assert.equal(trajectory.runs[0]?.assistantMessageId, turn.assistantMessage.id);
   assert.deepEqual(events, [
     { type: "turn.started", runId: "run-1", userMessage: turn.userMessage },
     { type: "model.started", callIndex: 1 },

@@ -20,9 +20,26 @@ export interface SessionMessage {
   reasoning?: { callIndex: number; text: string }[];
 }
 
+export type AgentRunStep =
+  | { type: "model"; callIndex: number; phase: "waiting" | "generating" }
+  | { type: "reasoning"; callIndex: number; text: string }
+  | { type: "tool"; callIndex: number; callId: string; name: string; arguments: unknown; result: string };
+
+export interface CompletedAgentRun {
+  id: string;
+  sessionId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  status: "completed";
+  startedAt: string;
+  completedAt: string;
+  steps: AgentRunStep[];
+}
+
 export interface SessionHistory {
   session: SessionRecord;
   messages: SessionMessage[];
+  runs: CompletedAgentRun[];
 }
 
 export interface AgentTurn {
@@ -65,7 +82,12 @@ export async function createSession(): Promise<SessionRecord> {
 }
 
 export async function fetchHistory(sessionId: string): Promise<SessionHistory> {
-  return request<SessionHistory>(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
+  const history = await request<{
+    session: SessionRecord;
+    messages: SessionMessage[];
+    runs?: CompletedAgentRun[];
+  }>(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
+  return { ...history, runs: history.runs ?? [] };
 }
 
 export async function sendMessage(sessionId: string, text: string, allowTools: readonly string[] = []): Promise<AgentTurn> {

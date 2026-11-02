@@ -5,11 +5,12 @@ import {
   createSession,
   executeTurn,
   getHistory,
+  getSessionTrajectory,
   InvalidArgumentError,
   listSessions,
   SessionNotFoundError,
   type AgentTool,
-  type SessionRepository,
+  type ApplicationRepository,
   type TextGenerationProvider,
 } from "../../packages/application";
 import { LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
@@ -23,7 +24,7 @@ interface ApiFailure {
 }
 
 export interface WebApiDependencies {
-  repository: SessionRepository;
+  repository: ApplicationRepository;
   provider: TextGenerationProvider;
   tools?: readonly AgentTool[];
 }
@@ -45,7 +46,7 @@ export function createWebApiServer({ repository, provider, tools = [] }: WebApiD
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   provider: TextGenerationProvider,
   availableTools: readonly AgentTool[],
   serializeMutation: <T>(operation: () => Promise<T>) => Promise<T>,
@@ -66,7 +67,7 @@ async function handleRequest(
     const historyRoute = /^\/api\/sessions\/([^/]+)\/history$/.exec(url.pathname);
     if (historyRoute !== null && request.method === "GET") {
       const sessionId = decodePathSegment(historyRoute[1]);
-      sendJson(response, 200, { ok: true, ...(await getHistory(repository, sessionId)) });
+      sendJson(response, 200, { ok: true, ...(await getSessionTrajectory(repository, sessionId)) });
       return;
     }
 
@@ -159,7 +160,7 @@ async function handleRequest(
 }
 
 async function streamTurnResponse(
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   provider: TextGenerationProvider,
   sessionId: string,
   text: string,
@@ -276,7 +277,7 @@ function waitForDrain(response: ServerResponse, signal: AbortSignal): Promise<vo
 }
 
 async function findFailedUserMessageId(
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   sessionId: string,
   text: string,
 ): Promise<string | undefined> {

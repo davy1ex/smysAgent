@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { SqliteApplicationRepository } from "../../packages/storage";
 
 const cliPath = resolve(__dirname, "../../apps/cli/main.js");
 
@@ -52,10 +53,13 @@ function runCliFrom(cwd: string, args: string[], envDataDir?: string) {
 }
 
 async function readStore(dataDir: string): Promise<{ sessions: Array<{ id: string }>; messages: unknown[] }> {
-  return JSON.parse(await readFile(join(dataDir, "store.json"), "utf8")) as {
-    sessions: Array<{ id: string }>;
-    messages: unknown[];
-  };
+  const repository = new SqliteApplicationRepository(dataDir);
+  try {
+    const histories = await repository.listSessionHistories();
+    return { sessions: histories.map(({ session }) => session), messages: histories.flatMap(({ messages }) => messages) };
+  } finally {
+    await repository.close();
+  }
 }
 
 async function startLmStudioStub(status: number, payload: unknown): Promise<{

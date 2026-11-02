@@ -13,6 +13,11 @@ export interface TurnPresentation {
   durationMs?: number;
 }
 
+export type CompletedRunStep =
+  | { type: "model"; callIndex: number; phase: "waiting" | "generating" }
+  | { type: "reasoning"; callIndex: number; text: string }
+  | { type: "tool"; callIndex: number; callId: string; name: string; arguments: unknown; result: string };
+
 export function createTurnPresentation(): TurnPresentation {
   return { status: "connecting", steps: [] };
 }
@@ -54,6 +59,31 @@ export function restoreCompletedReasoning(
     steps: [...reasoning]
       .sort((left, right) => left.callIndex - right.callIndex)
       .map(({ callIndex, text }) => ({ type: "reasoning", callIndex, text, status: "completed" })),
+  };
+}
+
+export function restoreCompletedRun(
+  steps: readonly CompletedRunStep[],
+  startedAt: string,
+  completedAt: string,
+): TurnPresentation | undefined {
+  if (steps.length === 0) return undefined;
+  const started = Date.parse(startedAt);
+  const completed = Date.parse(completedAt);
+  return {
+    status: "completed",
+    steps: steps.map((step): TurnStep => {
+      if (step.type === "model") {
+        return { ...step, status: "completed" };
+      }
+      if (step.type === "reasoning") {
+        return { ...step, status: "completed" };
+      }
+      return { ...step, status: "completed" };
+    }),
+    ...(Number.isFinite(started) && Number.isFinite(completed)
+      ? { durationMs: Math.max(0, completed - started) }
+      : {}),
   };
 }
 

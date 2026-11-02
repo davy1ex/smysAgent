@@ -1,30 +1,32 @@
 # SMYS — NOW
 
-> Проверено 2026-11-02 после backend persistence завершённых reasoning по исходникам, тестам, ADR и ручному прогону Live Reasoning на LM Studio.
+> Проверено 2026-11-02 после реализации SQLite completed-run traces, миграции JSON и восстановления Web истории по исходникам, тестам, ADR и независимому клиенту.
 
 ## Текущий фокус
 
-Live Inference UX и backend persistence reasoning завершённых ходов реализованы. Следующий отдельный срез — восстановление активного inference, durable run state и event replay; они не входят в текущую реализацию.
+Live Inference UX и восстановление trajectory завершённых ходов реализованы. Следующий отдельный срез — active inference recovery, reconnect и event replay; они не входят в текущую реализацию.
 
 ## Утверждённое направление и состояние
 
 - Стратегия SMYS и шесть направлений развития зафиксированы в [`PRODUCT.md`](./PRODUCT.md) и [`ROADMAP.md`](./ROADMAP.md).
-- **M1 — Unified Agent Execution:** общий Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Live reasoning event contract — [ADR-0013](./DECISIONS/ADR-0013-live-reasoning-deltas.md), безопасный Markdown Web — [ADR-0014](./DECISIONS/ADR-0014-safe-markdown-web.md), persistence reasoning завершённых ходов — [ADR-0015](./DECISIONS/ADR-0015-persist-completed-reasoning.md).
+- **M1 — Unified Agent Execution:** общий Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Live reasoning event contract — [ADR-0013](./DECISIONS/ADR-0013-live-reasoning-deltas.md), безопасный Markdown Web — [ADR-0014](./DECISIONS/ADR-0014-safe-markdown-web.md). [ADR-0016](./DECISIONS/ADR-0016-sqlite-completed-runs.md) supersedes способ persistence из ADR-0015.
 - LM Studio adapter вызывает необязательный `onReasoningDelta` при получении `reasoning_content`. Core публикует per-call `reasoning.delta`; существующий SSE передаёт его React до завершения model call. `reasoning.completed` остаётся canonical completion и обновляет блок, не дублируя текст.
 - React показывает в однострочном `Think` preview текущую логическую строку reasoning. Строка растёт по реальным дельтам и начинается заново после `\n`/`\r\n`; пустая активная строка показывает нейтральное `…`, а длинная — актуальный хвост с обрезанием слева. После завершения используется последняя непустая строка. Полный raw provider text сохраняется с исходными переносами и доступен по раскрытию; при отсутствии reasoning блок не создаётся. Первый `assistant.delta` завершает статус reasoning активного model call; `reasoning.completed` сверяет полный canonical text.
 - Web рендерит streaming и финальный assistant text через `react-markdown` + `remark-gfm`. Raw HTML не рендерится, небезопасные URL не становятся активными ссылками. Assistant `delta` остаётся потоковым.
-- Assistant message сохраняет необязательные per-call reasoning записи с callIndex и text для каждого завершённого model call. JSON store v3 мигрирует v1/v2 при первой записи и сохраняет исходный формат в versioned backup. History API возвращает reasoning внутри assistant message, React восстанавливает свёрнутые блоки после reload. sessionStorage не используется.
+- Completed AgentRun отдельно хранит ordered model, per-call full reasoning и tool steps. Run связан с session, user message и assistant message стабильными IDs; финальный текст существует только в обычном assistant message. Application history API возвращает messages и runs одним ответом; React восстанавливает timeline по `assistantMessageId`. `reasoning.completed` сохраняется ровно один раз; `reasoning.delta` остаётся stream-only.
+- Web Host и CLI используют SQLite `store.sqlite`; завершение сохраняет assistant message и trace атомарно. JSON v1/v2/v3 импортируется один раз с exact-byte backup `store.json.vN.sqlite.bak`; legacy reasoning сохраняется, исторические traces не выдумываются. Файл SQLite создаётся с mode `0600`; reasoning и tool args/results хранятся локально без маскирования/шифрования и не попадают в логи. `sessionStorage` не используется.
 
 ## Известные ограничения и открытые задачи
 
-- После Cmd+R completed reasoning восстанавливается из backend history. Незавершённый UI draft и active inference не восстанавливаются: закрытие SSE передаёт cancellation provider.
-- Нет durable active run state, event replay/reconnect, SQLite или межпроцессной inference resource lock. Это отдельные решения направления Persistent Runs / Trajectory.
+- Completed reasoning и tool/model trajectory восстанавливаются после перезапуска Web Host и из независимого browser/API клиента. Незавершённый UI draft и active inference не восстанавливаются: закрытие SSE передаёт cancellation provider.
+- Persisted traces есть только для успешно завершённых runs. Active run state, event replay/reconnect и inference resource lock не реализованы.
 - Аудит ошибок: `ECONNRESET` из `fetch` попадает в общий catch `src/packages/providers/lm-studio-provider.ts` и преобразуется в `LmStudioProviderError("Could not connect to LM Studio.")` без исходной ошибки/cause; Web Host классифицирует её как `PROVIDER_ERROR`, поэтому код `ECONNRESET` теряется. Отдельный fallback Host `An unexpected error occurred.` в `toApiFailure()` применяется к нераспознанным исключениям и также не раскрывает тип/cause; это generic error path, а не сообщение нормализованного `ECONNRESET`. Улучшение диагностики оставлено отдельной задачей.
 
 ## Evidence
 
 - Код пути событий: `src/packages/core/agent/model.ts`, `src/packages/core/agent/events.ts`, `src/packages/core/agent/runtime.ts`, `src/packages/providers/lm-studio-provider.ts`, `src/packages/providers/fake-provider.ts`, `src/apps/web-host/server.ts`, `src/apps/web/src/api.ts`, `src/apps/web-ui/turn-presentation.ts`, `src/apps/web/src/App.tsx`.
-- Проверки: npm test — 71 root tests + 3 Web Markdown tests passed; npm run typecheck, npm run lint и Web build прошли. UI checks покрывают смену preview после каждого line-oriented delta, пустые строки, `\r\n`, длинные строки, завершённый preview, полное накопление текста и независимость model calls. Fake Provider в браузере проверен на progressive line updates с настоящими переносами и задержками.
+- Проверки: 76 root + 3 Web tests прошли; также прошли root build, typecheck, lint и Web production build. Suite проверяет SQLite reopen, импорт v1/v2/v3 и exact backups, атомарность completed-run записи, ordered tool/reasoning restore, Web Host restart и два независимых API clients.
+- Ручная browser проверка: после завершённого run новый IAB tab открыл восстановленную Web Host сессию из SQLite и показал обе полные reasoning строки, `demo.add` между ними и один финальный assistant message. Это отдельный browser client, а не reload исходной вкладки.
 - Ручной прогон в браузере с реальной LM Studio, `qwen3.8-9b-mlx`: upstream `reasoning_content` появился до assistant `content`; React показал reasoning при пустом assistant draft. DOM polling выполнялся с периодом 250 мс; timestamps одного прогона, UTC:
 
   | Участок | Событие | Timestamp |
@@ -42,4 +44,4 @@ Live Inference UX и backend persistence reasoning завершённых ход
 
 ## Следующий шаг
 
-Спроектировать восстановление active run и replay отдельным ADR до изменения lifecycle/transport. Диагностику ECONNRESET также вести отдельной задачей. Ручная browser проверка reload после этой миграции не выполнена: CUA browser transport был закрыт; persistence покрыта storage/application/Web API тестами.
+Спроектировать active run recovery и replay отдельным ADR до изменения lifecycle/transport. Диагностику ECONNRESET вести отдельной задачей.

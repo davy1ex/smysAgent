@@ -18,9 +18,13 @@
     "web:host": "npm run build && node dist/src/apps/web-host/main.js"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.5",
     "eslint": "^10.13.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.1"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.9.0"
   }
 }

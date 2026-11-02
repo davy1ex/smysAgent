@@ -9,9 +9,9 @@ import {
   sendMessage,
   SessionNotFoundError,
   type AgentEvent,
-  type SessionRepository,
+  type ApplicationRepository,
 } from "../../packages/application";
-import { JsonFileSessionRepository, StorageError } from "../../packages/storage";
+import { SqliteApplicationRepository, StorageError } from "../../packages/storage";
 import { FakeProvider } from "../../packages/providers/fake-provider";
 import { LmStudioProvider, LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
 
@@ -45,7 +45,7 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
     ndjson = parsed.output === "ndjson";
     validateProviderSettings(parsed, env);
     const dataDir = resolveDataDir(parsed.options.get("data-dir"), env);
-    const repository = new JsonFileSessionRepository(dataDir);
+    const repository = new SqliteApplicationRepository(dataDir);
     const controller = parsed.command === "agent-run" ? new AbortController() : undefined;
     const abortOnInterrupt = () => controller?.abort();
     if (controller !== undefined) process.once("SIGINT", abortOnInterrupt);
@@ -188,7 +188,7 @@ function parseCommand(argv: string[]): ParsedCommand {
 
 async function execute(
   parsed: ParsedCommand,
-  repository: SessionRepository,
+  repository: ApplicationRepository,
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {

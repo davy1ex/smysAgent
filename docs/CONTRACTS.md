@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API, local Web HTTP API и CLI фиксируют реализованные контракты и формат JSON-хранилища. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; единое исполнение, event streaming и completed reasoning persistence — в ADR-0012—0015. Event journal и record/replay остаются будущими сценариями.
+**Статус:** разделы Application API, local Web HTTP API, CLI и SQLite storage описывают реализованные контракты. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; единое исполнение, event streaming, completed reasoning и AgentRun persistence — в ADR-0012—0016. Active run replay остаётся будущим сценарием.
 
 ## Принципы проектирования
 
@@ -22,7 +22,7 @@ CLI — ранний headless-вход для ручного запуска, с�
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
-`executeTurn` и один Core runtime loop обслуживают hosts с текстовым и потоковым выводом. Application events передаются через callback; Web host переносит runtime events в SSE. Reasoning завершённых успешных model calls сохраняется per-call на assistant message; полный журнал событий и record/replay остаются будущими задачами.
+`executeTurn` и один Core runtime loop обслуживают hosts с текстовым и потоковым выводом. Application events передаются через callback; Web host переносит runtime events в SSE. После успеха Application отдельно сохраняет completed AgentRun trace, связанный с user и assistant messages. Полный журнал событий, active-run replay и reconnect остаются будущими задачами.
 
 ### Сигнатуры реализованных use cases
 
@@ -32,10 +32,11 @@ CLI не содержит собственной реализации agent loop
 createSession(repository: SessionRepository): Promise<Session>
 listSessions(repository: SessionRepository): Promise<SessionSummary[]>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-executeTurn(repository: SessionRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
+executeTurn(repository: ApplicationRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
 runAgentTurn(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> // compatibility delegate
 runAgentTurnStreaming(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }> // compatibility delegate
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
+getSessionTrajectory(repository: ApplicationRepository, sessionId: string): Promise<SessionTrajectory>
 
 interface SessionSummary {
   id: string;
@@ -50,6 +51,34 @@ interface SessionRepository {
   appendUserMessage(sessionId: string, draft: { id: string; createdAt: string; text: string }): Promise<UserMessage | null>;
   appendAssistantMessage(sessionId: string, draft: { id: string; createdAt: string; text: string; reasoning?: { callIndex: number; text: string }[] }): Promise<AssistantMessage | null>;
   getHistory(sessionId: string): Promise<SessionHistory | null>;
+}
+
+type AgentRunStep =
+  | { type: "model"; callIndex: number; phase: "waiting" | "generating" }
+  | { type: "reasoning"; callIndex: number; text: string }
+  | { type: "tool"; callIndex: number; callId: string; name: string; arguments: unknown; result: string };
+
+interface CompletedAgentRun {
+  id: string;
+  sessionId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  status: "completed";
+  startedAt: string;
+  completedAt: string;
+  steps: AgentRunStep[];
+}
+
+interface AgentRunRepository {
+  /** Atomically appends the assistant message and the completed run trace. */
+  completeRun(input: { run: CompletedAgentRun; assistantMessage: AssistantMessageDraft }): Promise<AssistantMessage | null>;
+  listCompletedRuns(sessionId: string): Promise<CompletedAgentRun[]>;
+}
+
+type ApplicationRepository = SessionRepository & AgentRunRepository;
+
+interface SessionTrajectory extends SessionHistory {
+  runs: CompletedAgentRun[];
 }
 
 interface AgentExecutionOptions {
@@ -92,9 +121,9 @@ interface AgentTurnStreamHandlers {
 }
 ```
 
-`listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению; в JSON store эти поля не добавляются. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `executeTurn` сохраняет пользователя, загружает историю, запускает единый runtime и сохраняет финальный текст ассистента с необязательным массивом per-call reasoning. Вызов получает или генерирует `runId`; это идентификатор хода, но не сохранённый execution trace. При наличии reasoning API также возвращает его агрегированную строку; Web и CLI могут её отобразить. История сохраняет completed записи `{ callIndex, text }` в порядке вызовов модели. CLI по умолчанию не передаёт инструменты; `--tool demo.add` подключает его, а отдельный `--allow-tool demo.add` разрешает исполнение. Web передаёт `allowTools` только после явного выбора для текущего хода. Другие application callers также могут передать максимум один инструмент и явную permission policy. При ошибке или отмене после записи пользователя ответ ассистента и его reasoning не добавляются. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
+`listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `executeTurn` сохраняет пользователя, загружает историю и запускает единый runtime. После успеха он вызывает `completeRun()`, который одной транзакцией сохраняет финальный assistant message и ordered trace с `runId`, `sessionId`, `userMessageId` и `assistantMessageId`. Assistant text не копируется в trace. `reasoning.completed` сохраняется по одному разу на вызов модели; стриминговые deltas не записываются. При наличии reasoning API также возвращает его агрегированную строку. `getSessionTrajectory` собирает историю сообщений и завершённые runs; старые сообщения без run допустимы. CLI по умолчанию не передаёт инструменты; `--tool demo.add` подключает его, а отдельный `--allow-tool demo.add` разрешает исполнение. Web передаёт `allowTools` только после явного выбора для текущего хода. При ошибке или отмене после записи пользователя ответ и trace не сохраняются. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
-Необязательный `onEvent` получает события последовательно при обоих режимах provider. Runtime отправляет `model.started`, `model.completed`, reasoning deltas/completions, `tool.requested`, `tool.started`, `tool.completed` и, если задан `onTextDelta`, `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с сохранением: `turn.started` идёт после записи user message, `turn.completed` — после записи assistant message, содержащего completed per-call reasoning при его наличии, и может содержать совместимое агрегированное `reasoning`; `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Runtime events не журналируются, Application переносит только canonical reasoning.completed записи в финальный assistant message.
+Необязательный `onEvent` получает события последовательно при обоих режимах provider. Runtime отправляет `model.started`, `model.completed`, reasoning deltas/completions, `tool.requested`, `tool.started`, `tool.completed` и, если задан `onTextDelta`, `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с persistence: `turn.started` идёт после записи user message, `turn.completed` — после атомарного сохранения assistant message и completed run и может содержать агрегированное `reasoning`; `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Полный event journal не записывается; Application формирует trace steps из model/reasoning/tool events, игнорируя reasoning deltas для persistence.
 
 ### Local Web HTTP API
 
@@ -104,17 +133,17 @@ Host `src/apps/web-host` слушает только `127.0.0.1` (порт по 
 | --- | --- |
 | `GET /api/sessions` | Возвращает `{ ok, sessions }`; элемент содержит `id`, `createdAt`, `updatedAt`, `title`. |
 | `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию и возвращает `{ ok, session }` с HTTP 201. |
-| `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages }` по `sequence`; assistant message может содержать per-call reasoning. |
+| `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages, runs }`: сообщения по `sequence`, completed run traces в порядке user messages. Legacy assistant messages могут содержать per-call `reasoning`; новые reasoning blocks находятся в `runs[].steps`. |
 | `POST /api/sessions/:id/messages` | Принимает `{ text, allowTools? }`, вызывает `executeTurn` и возвращает `runId`, `userMessage`, `assistantMessage` и необязательный `reasoning`. Запрос ждёт завершения provider. |
 | `POST /api/sessions/:id/messages/stream` | Принимает `{ text, allowTools? }`, вызывает тот же `executeTurn` и возвращает SSE lifecycle, model, reasoning, tool и text-delta events. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. |
 
-Формат SSE события — `event: <type>` и одна JSON-строка `data:`. В payload каждого события есть `runId`. Lifecycle-события содержат `{ userMessage }`, `{ assistantMessage, reasoning? }` или `{ error: { code, message, turnId? } }`; assistant message в `turn.completed` может включать сохранённые per-call reasoning записи. Остальные используют поля соответствующего `AgentRuntimeEvent`. Начальное событие отправляется после сохранения user message. Дельты текста и reasoning во время исполнения остаются временными; Application сохраняет финальный ответ и completed per-call reasoning только после корректного завершения provider. `turn.completed` отправляется после успешной записи assistant message. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
+Формат SSE события — `event: <type>` и одна JSON-строка `data:`. В payload каждого события есть `runId`. Lifecycle-события содержат `{ userMessage }`, `{ assistantMessage, reasoning? }` или `{ error: { code, message, turnId? } }`; aggregate `reasoning` остаётся совместимым полем события, а новый `assistantMessage` не дублирует его. Остальные используют поля соответствующего `AgentRuntimeEvent`. Начальное событие отправляется после сохранения user message. Дельты текста и reasoning во время исполнения остаются временными; Application сохраняет финальный ответ и full completed trace одной транзакцией только после успешного завершения provider. `turn.completed` отправляется после успешной транзакции. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant или completed run. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
 
 `allowTools` — необязательный массив уникальных имён инструментов. Web host отклоняет неизвестные имена; пустой или отсутствующий массив оставляет Runtime без tools. Каждый выбранный инструмент передаётся с policy, которая разрешает только grant текущего запроса. Встроенный UI запрашивает grant `demo.add` отдельным checkbox и сбрасывает его после отправки.
 
 Ошибки имеют форму `{ ok: false, error: { code, message, runId?, turnId? } }`. Неверный запрос возвращает 400, отсутствующая сессия — 404, сбой provider/runtime — 502, ошибка хранилища или неизвестная ошибка — 500. При сбое после сохранения user message host возвращает её `turnId`, чтобы UI показал ошибку на соответствующем ходе; безопасное сообщение ошибки не содержит токен или ответ сервера LM Studio.
 
-Изменяющие API-запросы выполняются последовательно в процессе host. Запускать CLI или второй host с тем же `SMYS_DATA_DIR` для параллельной записи нельзя: JSON adapter не синхронизирует процессы.
+Изменяющие запросы одного Web Host по-прежнему сериализуются в процессе. SQLite transaction защищает короткие операции записи и поддерживает несколько host/CLI процессов с одним `SMYS_DATA_DIR`; отдельный inference resource lock не реализован.
 
 Запуск из корня репозитория в двух терминалах:
 
@@ -132,7 +161,7 @@ cd src/apps/web && npm run dev
 
 Для LM Studio в первом терминале задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<model-id>` перед `npm run web:host`.
 
-Fake provider используется по умолчанию. Для LM Studio задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint берётся из `LM_STUDIO_ENDPOINT` или `http://localhost:1234/v1/chat/completions`, токен — из необязательного `LM_API_TOKEN`. `SMYS_DATA_DIR` задаёт каталог JSON store, `SMYS_WEB_PORT` — порт API, `SMYS_API_URL` — target Vite proxy.
+Fake provider используется по умолчанию. Для LM Studio задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint берётся из `LM_STUDIO_ENDPOINT` или `http://localhost:1234/v1/chat/completions`, токен — из необязательного `LM_API_TOKEN`. `SMYS_DATA_DIR` задаёт каталог SQLite store, `SMYS_WEB_PORT` — порт API, `SMYS_API_URL` — target Vite proxy.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -166,15 +195,15 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 
 Каждый обычный JSON-ответ занимает одну строку. При ошибке JSON-режима CLI пишет `{"ok":false,"error":{"code":"...","message":"..."}}` в stderr. Коды выхода стабильны: `0` успех, `1` внутренняя ошибка или ошибка provider, `2` неверная команда/аргументы, `3` сессия не найдена, `4` ошибка хранилища, `130` отмена по SIGINT (`ABORTED`). Сбой LM Studio использует существующий `INTERNAL_ERROR` и код `1`; сообщение не раскрывает тело ответа сервера, токен или текст запроса. `--stream` печатает текстовые дельты и завершает строку после успешного ответа; `--stream --output ndjson` печатает по одному JSON событию на строку, включая `turn.completed`. Потоковый режим несовместим с `--json`; прежний `--json` вывод не меняется.
 
-Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; обычный текстовый вывод печатает его перед финальным ответом, а `--stream` направляет reasoning в stderr. Per-call блоки также сохраняются в assistant message и истории; верхнеуровневая агрегированная строка остаётся совместимым результатом текущего вызова.
+Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; обычный текстовый вывод печатает его перед финальным ответом, а `--stream` направляет reasoning в stderr. Per-call blocks сохраняются в completed AgentRun trace; верхнеуровневая агрегированная строка остаётся совместимым результатом текущего вызова.
 
 `agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
 
 Ручной provider smoke test выполняется командой `npm run smoke:lm-studio`; она требует `LM_STUDIO_MODEL`, использует `LM_STUDIO_ENDPOINT` или стандартный endpoint и при наличии передаёт `LM_API_TOKEN`. Команда делает один non-streaming текстовый запрос и возвращает JSON в stdout/stderr. Она не входит в `npm test` и требует запущенный локальный LM Studio server.
 
-Каталог хранилища выбирается по приоритету: `--data-dir`, переменная окружения `SMYS_DATA_DIR`, затем `.smys-agent` в папке запуска CLI. При запуске через npm используется исходная папка вызова npm (`INIT_CWD`). Пути относительно папки запуска разрешаются от неё. Текущий `store.json` содержит `formatVersion: 3`, массивы `sessions` и `messages`; сообщения имеют роль `user` или `assistant`, одну текстовую часть `content`, ISO-время и целый `sequence`, уникальный в пределах сессии. Assistant message может содержать optional reasoning массив `{ callIndex, text }` с возрастающими уникальными callIndex. История читается по возрастанию `sequence`. Запись выполняется через временный файл с последующим rename.
+Каталог хранилища выбирается по приоритету: `--data-dir`, переменная окружения `SMYS_DATA_DIR`, затем `.smys-agent` в папке запуска CLI. При запуске через npm используется исходная папка вызова npm (`INIT_CWD`). Пути относительно папки запуска разрешаются от неё. Активная БД — `store.sqlite` с `user_version: 1`; она хранит sessions, messages, completed runs и упорядоченные run steps. Сообщения имеют роль `user` или `assistant`, одну текстовую часть `content`, ISO-время и целый `sequence`, уникальный в пределах сессии. Только импортированное legacy assistant message может содержать `reasoning` массив `{ callIndex, text }`; новые reasoning блоки живут в trace.
 
-Форматы v1 и v2 принимаются для чтения без записи на диск. При первой мутации валидный store мигрирует прямо в v3; исходные bytes сохраняются соответственно в `store.json.v1.bak` или `store.json.v2.bak`. Существующий backup допускается только при точном совпадении с исходным файлом. Неизвестная версия и повреждённый документ отклоняются без изменения файла. После миграции старые версии приложения, которые понимают только v1/v2, не могут читать основной файл; для возврата доступна versioned копия. Одновременные записи нескольких процессов и идемпотентность повторной команды этим срезом не гарантируются.
+При первой инициализации новой SQLite БД существующий валидный JSON v1/v2/v3 импортируется один раз транзакционно; исходные bytes сохраняются в `store.json.vN.sqlite.bak`. Импорт переносит sessions/messages, IDs, sequence, timestamps, legacy reasoning и дополнительные JSON поля; old runs не реконструируются, поэтому их traces пусты. При существующей SQLite БД JSON не читается повторно и не используется для записи. Неизвестная версия и повреждённый JSON отклоняются без изменения исходника. Если импорт не завершается, новая БД удаляется, а JSON остаётся источником для следующего запуска. После импорта downgrade на старый JSON-only host без экспорта теряет новые данные; SQLite БД следует сохранить для отката.
 
 ## Внутренние сущности
 
@@ -269,7 +298,7 @@ interface ToolPermissionPolicy {
 
 В одном ходе можно передать максимум один инструмент. `inputSchema` описывает аргументы provider, а локальный `validateInput` проверяет их перед выполнением; общий JSON Schema engine не добавлен, поэтому реализация инструмента должна поддерживать соответствие этих двух описаний. Runtime проверяет имя и `validateInput`, затем вызывает policy и выполняет инструмент только при ответе `allow`; отсутствие policy делает конфигурацию с инструментом недействительной. CLI требует отдельные `--tool` и `--allow-tool`; Web передаёт выбранный пользователем `allowTools` список только на текущий ход, а host формирует policy исключительно по этому списку. `ask-user` в середине хода не поддерживается; Web grant даётся перед отправкой запроса. Лимит — два вызова модели и один вызов инструмента за ход; повторный tool call отклоняется до выполнения. Ошибки имени, аргументов, разрешения, инструмента и лимита завершают ход без финального ответа.
 
-Вызовы и результаты инструментов добавляются только во временный контекст provider. Store v3 сохраняет пользовательское сообщение и финальный текст ассистента, а также completed per-call reasoning при наличии. Tool arguments/results и runtime event journal не сохраняются. При ошибке после записи пользователя ответ ассистента не добавляется.
+Вызовы и результаты инструментов добавляются во временный контекст provider. После успешного хода SQLite сохраняет полный reasoning и tool arguments/results как упорядоченные шаги completed run, отдельно от пользовательского и финального assistant messages. Ошибочные и отменённые runs не сохраняются. БД создаётся с правами файла `0600`; tool payload и reasoning не маскируются и не шифруются, не выводятся в логи и имеют тот же срок хранения, что и история сессии. Provider credentials не попадают в trace.
 
 Runtime ограничивает ход двумя запросами модели и одним вызовом инструмента. Итерация — один запрос provider и один ответ; само выполнение инструмента отдельной итерацией не считается. Инструменты передаются вызывающим application code; динамической загрузки, discovery, повторов и интерактивного `ask-user` нет. Ошибки runtime типизированы (`INVALID_CONFIGURATION`, `INVALID_MODEL_RESPONSE`, `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `PERMISSION_DENIED`, `PERMISSION_CHECK_FAILED`, `TOOL_EXECUTION_FAILED`, `LOOP_LIMIT`); CLI показывает их через существующий `INTERNAL_ERROR` и код выхода `1`. Отмена provider или tool operation распространяет `AbortSignal`; CLI выводит `ABORTED` с кодом `130` по SIGINT.
 
@@ -285,7 +314,7 @@ Runtime ограничивает ход двумя запросами модел
 - экспортировать данные в собственном документированном формате;
 - предоставить поток/подписку на изменения для обновления UI и восстановления после перезапуска.
 
-Для текущего JSON-хранилища v3 определены атомарная замена файла, порядок сообщений и миграции форматов v1/v2 → v3 выше. Общая стратегия будущих миграций, конкурентная запись, идемпотентность повторной команды, event journal и экспорт остаются открытыми.
+Для активной SQLite schema v1 versioning выполняется через `PRAGMA user_version`; JSON v1/v2/v3 importer описан выше. SQLite завершение run атомарно фиксирует assistant message и trace, а `busy_timeout` ждёт короткие конкурирующие записи. Idempotency повторной команды, active event journal, replay и общий экспорт всех run payload остаются открытыми.
 
 ## Черновик: record/replay
 

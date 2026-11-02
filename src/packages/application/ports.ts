@@ -29,3 +29,27 @@ export interface SessionRepository {
   appendAssistantMessage(sessionId: SessionId, draft: AssistantMessageDraft): Promise<AssistantMessage | null>;
   getHistory(sessionId: SessionId): Promise<SessionHistory | null>;
 }
+
+export type AgentRunStep =
+  | { type: "model"; callIndex: number; phase: "waiting" | "generating" }
+  | { type: "reasoning"; callIndex: number; text: string }
+  | { type: "tool"; callIndex: number; callId: string; name: string; arguments: unknown; result: string };
+
+export interface CompletedAgentRun {
+  id: string;
+  sessionId: SessionId;
+  userMessageId: MessageId;
+  assistantMessageId: MessageId;
+  status: "completed";
+  startedAt: string;
+  completedAt: string;
+  steps: AgentRunStep[];
+}
+
+export interface AgentRunRepository {
+  /** Atomically appends the final assistant message and its completed run trace. */
+  completeRun(input: { run: CompletedAgentRun; assistantMessage: AssistantMessageDraft }): Promise<AssistantMessage | null>;
+  listCompletedRuns(sessionId: SessionId): Promise<CompletedAgentRun[]>;
+}
+
+export type ApplicationRepository = SessionRepository & AgentRunRepository;

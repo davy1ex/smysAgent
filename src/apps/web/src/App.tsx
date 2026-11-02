@@ -8,6 +8,7 @@ import {
   failTurn,
   getReasoningPreview,
   markAssistantDelta,
+  restoreCompletedRun,
   restoreCompletedReasoning,
   type TurnPresentation,
   type TurnStep,
@@ -82,6 +83,20 @@ function MessageItem({
       {isUser && <span className="user-avatar">D</span>}
     </article>
   );
+}
+
+function presentationForAssistant(
+  message: SessionMessage,
+  previous: SessionMessage | undefined,
+  history: SessionHistory | undefined,
+  turnsByUserMessage: Readonly<Record<string, TurnPresentation>>,
+): TurnPresentation | undefined {
+  if (message.role !== "assistant") return undefined;
+  const run = history?.runs.find((candidate) => candidate.assistantMessageId === message.id);
+  if (run !== undefined) {
+    return turnsByUserMessage[run.userMessageId] ?? restoreCompletedRun(run.steps, run.startedAt, run.completedAt);
+  }
+  return previous?.role === "user" ? turnsByUserMessage[previous.id] : undefined;
 }
 
 function TurnTimeline({
@@ -312,9 +327,7 @@ function ChatTimeline({
       {visibleMessages.map((message, index) => {
         const previous = index > 0 ? visibleMessages[index - 1] : undefined;
         const next = visibleMessages[index + 1];
-        const presentation = message.role === "assistant" && previous?.role === "user"
-          ? turnsByUserMessage[previous.id]
-          : undefined;
+        const presentation = presentationForAssistant(message, previous, history, turnsByUserMessage);
         const standalonePresentation = message.role === "user" && next?.role !== "assistant"
           ? turnsByUserMessage[message.id]
           : undefined;
@@ -364,9 +377,7 @@ function Trajectory({
           {visibleMessages.map((message, index) => {
             const previous = index > 0 ? visibleMessages[index - 1] : undefined;
             const next = visibleMessages[index + 1];
-            const presentation = message.role === "assistant" && previous?.role === "user"
-              ? turnsByUserMessage[previous.id]
-              : undefined;
+            const presentation = presentationForAssistant(message, previous, history, turnsByUserMessage);
             const standalonePresentation = message.role === "user" && next?.role !== "assistant"
               ? turnsByUserMessage[message.id]
               : undefined;
@@ -637,7 +648,7 @@ export function App() {
         title: "Новый чат",
       };
       setSessions((current) => [summary, ...current]);
-      setHistoryBySession((current) => ({ ...current, [session.id]: { session, messages: [] } }));
+      setHistoryBySession((current) => ({ ...current, [session.id]: { session, messages: [], runs: [] } }));
       setActiveSessionId(session.id);
       if (isMobile) setSidebarOpen(false);
     } catch (cause) {
@@ -705,7 +716,7 @@ export function App() {
         [turn.userMessage.id]: completeTurn(current[turn.userMessage.id] ?? createTurnPresentation(), durationMs),
       }));
       setHistoryBySession((current) => {
-        const previous = current[sessionId] ?? { session: { id: sessionId, createdAt: turn.userMessage.createdAt }, messages: [] };
+        const previous = current[sessionId] ?? { session: { id: sessionId, createdAt: turn.userMessage.createdAt }, messages: [], runs: [] };
         const existing = new Set(previous.messages.map((message) => message.id));
         return {
           ...current,
