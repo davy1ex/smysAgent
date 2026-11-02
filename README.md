@@ -1,43 +1,19 @@
-# My Harness
+# SMYS
 
-Заявленная цель — локальный AI-harness для проектов, чатов, исследований и автоматизации. Это пока продуктовая гипотеза; текущая реализация и открытые границы MVP описаны в [PRODUCT.md](docs/PRODUCT.md).
+SMYS — локальная модульная AI-платформа с Web UI и CLI. Оба интерфейса используют общий Application API и SQLite-хранилище. Через Web UI можно добавлять OpenAI-compatible endpoints, выбирать модель для сессии и начинать следующий ход без перезапуска host.
 
-## Состояние
+Реализован единый OpenAI-compatible Chat Completions adapter, а не отдельная интеграция под каждый сервер. Поэтому LM Studio, Ollama и облачный API вроде OpenAI можно подключить, если endpoint поддерживает совместимые `/v1/chat/completions` и формат запросов/ответов. LM Studio также сохраняет legacy adapter для совместимости. Сам факт поддержки протокола не гарантирует, что конкретная модель умеет streaming, tool calling или reasoning; обнаружение моделей не подтверждает эти capabilities.
 
-Реализованы CLI и локальный React Web-клиент поверх одного Application API. Web host управляет OpenAI-compatible providers/models, выбором модели для сессии и ходами через общий provider adapter или legacy env fallback. Текст, reasoning, tools и cancellation проходят через единый Runtime; SQLite хранит сообщения, completed AgentRun traces и snapshot фактически выбранной модели. Конфигурация доступна после повторного открытия приложения. Активный run и его события после reload не восстанавливаются; projects пока не реализованы. CLI по умолчанию работает без инструментов; безопасный `demo.add` подключается и разрешается отдельными флагами.
+## Quick Start
 
-## Документация
+Требуются Node.js 20+ и npm. Для локальной модели сначала запустите LM Studio или Ollama и подготовьте модель.
 
-- [NOW.md](docs/NOW.md) — подтверждённое состояние и текущий фокус.
-- [CHANGELOG.md](docs/CHANGELOG.md) — заметные изменения проекта.
-- [ROADMAP.md](docs/ROADMAP.md) — утверждённые направления и фактический прогресс.
-- [IDEAS.md](docs/IDEAS.md) — идеи без обязательства реализации.
-- [PRODUCT.md](docs/PRODUCT.md) — пользователь, потребности и границы MVP.
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — модули, зависимости и потоки данных.
-- [CONTRACTS.md](docs/CONTRACTS.md) — реализованные API, CLI и формат хранения; далее — черновые контракты будущих возможностей.
-- [specs/](docs/specs/) — требования ближайших работ; технические контракты задают принятые ADR.
-- [DECISIONS/](docs/DECISIONS/README.md) — журнал технических решений и порядок утверждения ADR.
-- [AGENTS.md](AGENTS.md) — обязательный протокол работы AI над кодом.
+### Запуск SMYS
 
-## Установка и проверки
-
-Требуется Node.js 20 или новее и npm.
+В первом терминале из корня проекта:
 
 ```sh
 npm install
-npm run typecheck
-npm run lint
-npm run build
-npm test
-```
-
-`npm test` собирает TypeScript и запускает тесты application, storage, providers, CLI-процессов и Web HTTP API.
-
-### Локальный Web
-
-Web-приложение — отдельный Vite-пакет. Установите его зависимости. Затем запустите API и Vite в двух терминалах:
-
-```sh
 npm install --prefix src/apps/web
 npm run web:host
 ```
@@ -48,75 +24,31 @@ npm run web:host
 npm run --prefix src/apps/web dev
 ```
 
-Откройте адрес, напечатанный Vite. Fake provider используется по умолчанию. Добавьте LM Studio, Ollama или другой OpenAI-compatible endpoint через кнопку «Настроить провайдеры и модели» в composer; host перезапускать не нужно. Для старого сценария остаются `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<MODEL_ID>`. `SMYS_DATA_DIR` задаёт общий каталог SQLite-конфигурации и истории для Web и CLI. В текущем срезе API keys хранятся в macOS Keychain; на других платформах доступны endpoints без ключа.
+Откройте адрес Vite, напечатанный в терминале (обычно `http://127.0.0.1:5173`). По умолчанию используется Fake provider.
 
-Проверка типов и production-сборка:
+### Подключение модели
 
-```sh
-npm run --prefix src/apps/web typecheck
-npm run --prefix src/apps/web build
-```
+Добавьте provider через кнопку **«Модели»** в composer. Укажите имя, Base URL и при необходимости API key. Проверьте подключение, обнаружьте модели или введите точный Model ID вручную. Выберите модель в composer для текущей сессии либо задайте global default. Изменение применяется к следующему ходу и сохраняется в SQLite.
 
-Сессии показаны в группе «Без проекта». Вкладки «Чат» и «История» отображают сохранённые сообщения; во время генерации текст появляется постепенно, а ошибку или отмену UI привязывает к пользовательскому сообщению. Для изменения порта API можно задать `SMYS_WEB_PORT`, для Vite proxy — `SMYS_API_URL`.
+| Provider | Что запустить / подготовить | Base URL в SMYS | Model ID |
+| --- | --- | --- | --- |
+| LM Studio | Загрузить модель и включить Local Server в Developer tab | `http://localhost:1234/v1` | Выбрать из обнаруженных или указать ID LM Studio |
+| Ollama | `ollama pull llama3.2`; убедиться, что Ollama server запущен | `http://localhost:11434/v1` | Точное имя из `ollama list`, например `llama3.2` |
+| OpenAI API | Создать API key у провайдера | `https://api.openai.com/v1` | Точный ID доступной модели |
+| Другой OpenAI-compatible API | Взять Base URL и Model ID из документации провайдера | Например, `https://openrouter.ai/api/v1` | Точный ID модели у провайдера |
 
-## CLI
+Если endpoint не поддерживает `GET /models` или нужного ID нет в списке, добавьте его вручную. На macOS ключ хранится в Keychain и не передаётся обратно в браузер. На других платформах сохранение ключей сейчас не поддерживается; можно использовать endpoint без авторизации.
 
-Каждая команда поддерживает `--json`. По умолчанию хранилище создаётся в `.smys-agent/` внутри папки запуска. Его можно переопределить через `SMYS_DATA_DIR` или `--data-dir`. Подробные приоритеты, JSON-формы, коды ошибок и формат файла зафиксированы в [контракте CLI и хранения](docs/CONTRACTS.md).
+Для подробностей совместимости см. документацию [LM Studio](https://lmstudio.ai/docs/developer/openai-compat) и [Ollama](https://docs.ollama.com/api/openai-compatibility).
 
-```sh
-# Создать сессию и сохранить первое сообщение.
-npm run --silent cli -- session create --json --initial-message "Привет"
+## Хранилище и CLI
 
-# Добавить сообщение в существующую сессию.
-npm run --silent cli -- message send --json --session-id <SESSION_ID> --text "Ещё одно сообщение"
+По умолчанию база и конфигурация находятся в `.smys-agent/store.sqlite` относительно каталога запуска host. `SMYS_DATA_DIR` задаёт общий каталог для Web и CLI. CLI может использовать сохранённый выбор или передать одноразовый `--model-config-id`; прежние env-настройки остаются fallback.
 
-# Прочитать историю.
-npm run --silent cli -- history get --json --session-id <SESSION_ID>
+## Документация
 
-# Выполнить один детерминированный ход через fake provider.
-npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_ID> --text "Ответь на это сообщение"
-
-# Использовать глобальную или session-модель из общего SQLite config.
-npm run --silent cli -- agent run --json --session-id <SESSION_ID> --text "Ответь на это сообщение"
-
-# Одноразово переопределить модель для этого запуска.
-npm run --silent cli -- agent run --json --model-config-id <MODEL_CONFIG_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
-
-# Выполнить один текстовый запрос через LM Studio.
-npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
-
-# Явно подключить demo.add и разрешить её исполнение через fake provider.
-npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_ID> --text "smoke demo.add" --tool demo.add --allow-tool demo.add
-
-# Попросить LM Studio вызвать demo.add с разрешёнными аргументами.
-npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Use demo.add with a=2 and b=3, then report the result." --tool demo.add --allow-tool demo.add
-```
-
-Если в общем store выбрана session/global модель, `agent run` использует её без provider-флагов; иначе продолжают работать явный `--provider` и прежний `SMYS_PROVIDER`. `--model-config-id` действует для одного запуска. Без `--tool` CLI не передаёт инструменты. `--tool demo.add` подключает единственный встроенный инструмент, а `--allow-tool demo.add` отдельно разрешает его исполнение. Настройка, JSON формы и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
-
-Инструмент доступен в CLI только при явной передаче обоих флагов `--tool demo.add` и `--allow-tool demo.add`.
-
-### Ручная проверка LM Studio
-
-Загрузите модель в LM Studio и включите Local Server. В fish задайте её точный ID и запустите проверку:
-
-```fish
-set -x LM_STUDIO_MODEL liquid/lfm2.5-1.2b
-npm run smoke:lm-studio
-```
-
-Endpoint по умолчанию — `http://localhost:1234/v1/chat/completions`; его можно переопределить через `LM_STUDIO_ENDPOINT`. Этот smoke test обращается к живому локальному серверу и не входит в `npm test`.
-
-### Проверка сохранения между процессами
-
-Команды запускаются отдельными процессами. Первый создаёт сессию и записывает сообщение, следующий выполняет ход, а последний читает историю из того же каталога:
-
-```sh
-set CREATED_JSON (npm run --silent cli -- session create --json --initial-message 'Сохрани это сообщение')
-printf '%s\n' "$CREATED_JSON"
-set SESSION_ID (printf '%s' "$CREATED_JSON" | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk).on("end", () => process.stdout.write(JSON.parse(data).session.id))')
-npm run --silent cli -- agent run --json --provider fake --session-id "$SESSION_ID" --text 'Проверь сохранение ответа'
-npm run --silent cli -- history get --json --session-id "$SESSION_ID"
-```
-
-Это команды для fish. Данные этой проверки сохраняются в `.smys-agent/store.sqlite` в корне проекта.
+- [Текущий статус и evidence](docs/NOW.md)
+- [Архитектура](docs/ARCHITECTURE.md)
+- [Контракты Web API, CLI и хранения](docs/CONTRACTS.md)
+- [Решение ADR-0017 о providers и models](docs/DECISIONS/ADR-0017-provider-model-configuration.md)
+- [Roadmap](docs/ROADMAP.md)
