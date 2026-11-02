@@ -6,6 +6,7 @@ import {
   completeTurn,
   createTurnPresentation,
   failTurn,
+  getReasoningPreview,
   markAssistantDelta,
   restoreCompletedReasoning,
   type TurnPresentation,
@@ -209,7 +210,7 @@ function ReasoningStepView({ step, detailed }: { step: Extract<TurnStep, { type:
     >
       <summary>
         <strong>{detailed ? `Размышление модели · вызов #${step.callIndex}` : label}</strong>
-        {!detailed && <span className="turn-reasoning-preview"><b>Think</b> · {step.text}</span>}
+        {!detailed && <span className="turn-reasoning-preview"><b>Think ·</b><span className="turn-reasoning-preview-text">{getReasoningPreview(step.text, { status: step.status })}</span></span>}
       </summary>
       <p className="turn-reasoning-text">{step.text}</p>
     </details>

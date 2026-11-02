@@ -17,6 +17,34 @@ export function createTurnPresentation(): TurnPresentation {
   return { status: "connecting", steps: [] };
 }
 
+export function getReasoningPreview(
+  text: string,
+  options: { status?: TurnStepExtractReasoningStatus; maxLength?: number } = {},
+): string {
+  const status = options.status ?? "running";
+  const lines = text.split(/\r\n|\n/u);
+  let currentLine = removeTrailingCarriageReturn(lines.at(-1) ?? "");
+
+  if (status === "completed" && currentLine.trim().length === 0) {
+    currentLine = [...lines]
+      .reverse()
+      .map(removeTrailingCarriageReturn)
+      .find((line) => line.trim().length > 0) ?? "";
+  } else if (currentLine.trim().length === 0) {
+    return status === "running" ? "…" : "";
+  }
+
+  const maxLength = Number.isFinite(options.maxLength) ? Math.max(1, Math.floor(options.maxLength!)) : 140;
+  if (currentLine.length <= maxLength) return currentLine;
+  return maxLength === 1 ? "…" : `…${currentLine.slice(-(maxLength - 1))}`;
+}
+
+type TurnStepExtractReasoningStatus = Extract<TurnStep, { type: "reasoning" }>["status"];
+
+function removeTrailingCarriageReturn(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
 export function restoreCompletedReasoning(
   reasoning: readonly { callIndex: number; text: string }[] | undefined,
 ): TurnPresentation | undefined {
@@ -144,11 +172,17 @@ export function applyTurnRuntimeEvent(
 export function markAssistantDelta(presentation: TurnPresentation): TurnPresentation {
   const activeModelIndex = lastMatchingIndex(presentation.steps, (step) => step.type === "model" && step.status === "running");
   if (activeModelIndex < 0) return presentation;
+  const activeModel = presentation.steps[activeModelIndex];
+  if (activeModel?.type !== "model") return presentation;
   return {
     ...presentation,
-    steps: presentation.steps.map((step, index) => index === activeModelIndex && step.type === "model"
-      ? { ...step, phase: "generating" }
-      : step),
+    steps: presentation.steps.map((step, index) => {
+      if (index === activeModelIndex && step.type === "model") return { ...step, phase: "generating" };
+      if (step.type === "reasoning" && step.callIndex === activeModel.callIndex && step.status === "running") {
+        return { ...step, status: "completed" };
+      }
+      return step;
+    }),
   };
 }
 
