@@ -41,9 +41,21 @@ npm run --prefix src/apps/web dev
 
 Для подробностей совместимости см. документацию [LM Studio](https://lmstudio.ai/docs/developer/openai-compat) и [Ollama](https://docs.ollama.com/api/openai-compatibility).
 
-## Хранилище и CLI
+## Данные чатов и CLI
 
-По умолчанию база и конфигурация находятся в `.smys-agent/store.sqlite` относительно каталога запуска host. `SMYS_DATA_DIR` задаёт общий каталог для Web и CLI. CLI может использовать сохранённый выбор или передать одноразовый `--model-config-id`; прежние env-настройки остаются fallback.
+Чаты, сообщения и завершённые run traces хранятся в SQLite: по умолчанию это `.smys-agent/store.sqlite` относительно каталога запуска host. `SMYS_DATA_DIR` задаёт общий каталог для Web и CLI. API keys хранятся отдельно в macOS Keychain, в SQLite лежат только ссылки на них.
+
+При первом создании SQLite-хранилища SMYS однократно импортирует существующий legacy `store.json` формата v1/v2/v3 и сохраняет рядом исходный файл как `store.json.vN.sqlite.bak`. Это миграция старого формата, а не общий импорт чатов. Полноценного импорта/экспорта всех чатов через UI или CLI пока нет.
+
+Можно вывести сообщения одной сессии в JSON и перенаправить их в файл:
+
+```sh
+npm run --silent cli -- history get --json --session-id <SESSION_ID> > chat.json
+```
+
+Это выгрузка списка сообщений одной сессии, без run traces; файл нельзя импортировать обратно через CLI. Для ручной резервной копии чатов и SQLite-конфигурации остановите Web Host и CLI-процессы и скопируйте `store.sqlite` из каталога данных. API keys в эту копию не входят: они находятся в Keychain.
+
+CLI может использовать сохранённый выбор модели или передать одноразовый `--model-config-id`; прежние env-настройки остаются fallback. Форматы CLI и хранения описаны в [контрактах](docs/CONTRACTS.md).
 
 ## Документация
 
