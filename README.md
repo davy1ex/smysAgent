@@ -1,5 +1,7 @@
 # SMYS
 
+![SMYS pixel art workbench](docs/assets/smys-pixelart-readme.png)
+
 SMYS — локальная модульная AI-платформа с Web UI и CLI. Оба интерфейса используют общий Application API и SQLite-хранилище. Через Web UI можно добавлять OpenAI-compatible endpoints, выбирать модель для сессии и начинать следующий ход без перезапуска host.
 
 Реализован единый OpenAI-compatible Chat Completions adapter, а не отдельная интеграция под каждый сервер. Поэтому LM Studio, Ollama и облачный API вроде OpenAI можно подключить, если endpoint поддерживает совместимые `/v1/chat/completions` и формат запросов/ответов. LM Studio также сохраняет legacy adapter для совместимости. Сам факт поддержки протокола не гарантирует, что конкретная модель умеет streaming, tool calling или reasoning; обнаружение моделей не подтверждает эти capabilities.
