@@ -17,7 +17,9 @@ npm run web:host
 npm run --prefix src/apps/web dev
 ```
 
-Откройте адрес, который напечатает Vite. Fake provider используется по умолчанию. Для LM Studio задайте `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint задаётся через `LM_STUDIO_ENDPOINT`, а токен — через `LM_API_TOKEN`. Каталог SQLite-хранилища можно изменить через `SMYS_DATA_DIR`.
+Откройте адрес, который напечатает Vite. Fake provider используется по умолчанию. Чтобы подключить LM Studio, Ollama или другой OpenAI-compatible endpoint, в composer откройте **«Настроить провайдеры и модели»**, укажите имя и Base URL, проверьте соединение, затем найдите модель через `/models` или добавьте точный Model ID вручную. Выберите модель в composer или задайте её как global default. Изменение применяется к следующему ходу без перезапуска host; каталог providers/models и выбор сессии сохраняются в SQLite и доступны после reload.
+
+`SMYS_DATA_DIR` задаёт общий каталог SQLite-конфигурации и истории для Web Host и CLI. Для старого сценария остаются `SMYS_PROVIDER`, `LM_STUDIO_MODEL`, `LM_STUDIO_ENDPOINT` и `LM_API_TOKEN`; они служат fallback, если сохранённая модель не выбрана. API keys хранятся в macOS Keychain; на других платформах доступны endpoints без ключа. Удалённый HTTP endpoint требует явного согласия.
 
 Vite проксирует `/api` в `http://127.0.0.1:3001`. Адрес API можно переопределить через `SMYS_API_URL`, порт host — через `SMYS_WEB_PORT`. Host слушает только loopback-интерфейс. SQLite-транзакции защищают короткие операции записи между несколькими host/CLI процессами с одним каталогом данных; inference resource lock не реализован.
 
@@ -26,8 +28,8 @@ Vite проксирует `/api` в `http://127.0.0.1:3001`. Адрес API мо
 | Host | Точка входа | Роль |
 | --- | --- | --- |
 | Web UI | `src/apps/web/src/main.tsx` | Монтирует React `App` в DOM-элемент `#root`. |
-| Web HTTP host | `src/apps/web-host/main.ts` | Создаёт repository и provider, запускает локальный HTTP API. |
-| CLI | `src/apps/cli/main.ts` | Разбирает CLI-команды и напрямую вызывает те же Application use cases. |
+| Web HTTP host | `src/apps/web-host/main.ts` | Создаёт общий SQLite repository, OpenAI-compatible provider factory и credential vault, запускает локальный HTTP API. |
+| CLI | `src/apps/cli/main.ts` | Разбирает CLI-команды, использует тот же SQLite config/resolver и напрямую вызывает Application use cases. |
 
 Браузерный UI не импортирует Application или Core. Его выходная граница — HTTP API. Vite proxy соединяет браузер с отдельным Node host; host вызывает Application use cases.
 
@@ -51,10 +53,12 @@ flowchart TD
   Chat --> Message["MessageItem"]
   Trajectory --> Message
   Panel --> Composer["Composer · ввод, отправка, остановка"]
+  App --> ProviderSettings["ProviderSettings · providers, models, defaults"]
 
   NewChat --> Handlers["Обработчики App"]
   Projects --> Handlers
   Composer --> Handlers
+  ProviderSettings --> Handlers
   Handlers --> API["api.ts"]
   API --> HTTP["/api · Vite proxy → web-host"]
   HTTP --> API
@@ -63,7 +67,7 @@ flowchart TD
   State --> Panel
 ```
 
-При загрузке `App` запрашивает список сессий и выбирает первую, затем загружает её messages и completed runs через history API. Создание чата и отправка сообщения идут через `api.ts`. Во время генерации текст и reasoning отображаются из временного состояния; после успеха UI завершает live presentation. Persisted trace загружается history API при открытии или повторном открытии сессии и связывается по ID assistant message.
+При загрузке `App` запрашивает список сессий и provider/model catalog, выбирает первую сессию, затем загружает её messages и completed runs через history API. Выбор модели для сессии приходит в Application session summary; он не добавлен в Core `Session`. Composer сохраняет session selection, а настройки открывают `ProviderSettings` для CRUD провайдеров, test/discovery и ручного Model ID. Создание чата и HTTP-вызовы идут через `api.ts`. Во время генерации текст и reasoning отображаются из временного состояния; после успеха UI обновляет history, и run snapshot показывает фактическую модель. При reload persisted trace загружается по ID assistant message, selection и provider catalog — из SQLite API.
 
 ## Поток сообщения через HTTP, Application и Core
 
@@ -74,13 +78,18 @@ sequenceDiagram
   participant Host as web-host
   participant App as Application
   participant Repo as ApplicationRepository
+  participant Config as Provider/model config + vault
   participant Core as Core Agent Runtime
   participant Model as Provider
 
   UI->>Adapter: отправить текст
   Adapter->>Host: POST /api/sessions/:id/messages/stream
   Host->>Host: проверить запрос, создать runId и AbortController
-  Host->>App: executeTurn + event callback
+  Host->>App: resolveModelForRun(per-run → session → global)
+  App->>Config: load provider/model config and credential
+  Config-->>App: pinned endpoint, Model ID, credential
+  App-->>Host: provider instance + run snapshot
+  Host->>App: executeTurn(provider, snapshot, event callback)
   App->>Repo: сохранить user message
   App-->>Host: onStarted
   Host-->>Adapter: SSE turn.started
@@ -118,13 +127,13 @@ sequenceDiagram
 
 | Слой | Ответственность | Основные файлы |
 | --- | --- | --- |
-| Web UI | Отображение сессий и сообщений, ввод пользователя, локальное состояние текущего хода | `src/apps/web/src/{main.tsx,App.tsx,api.ts,styles.css}` |
-| Web host | HTTP/SSE transport, конфигурация provider и хранилища, сериализация изменяющих запросов | `src/apps/web-host/{main.ts,server.ts}` |
+| Web UI | Отображение сессий и сообщений, выбор session model, управление providers/models, локальное состояние текущего хода | `src/apps/web/src/{main.tsx,App.tsx,ProviderSettings.tsx,api.ts,styles.css}` |
+| Web host | HTTP/SSE transport, legacy env/data-dir config, same-host checks, сериализация изменяющих запросов | `src/apps/web-host/{main.ts,server.ts}` |
 | CLI host | CLI-команды, конфигурация и скриптовый вывод | `src/apps/cli/` |
-| Application | Use cases сессий и ходов; связывает Core с repository/provider портами | `src/packages/application/` |
+| Application | Use cases сессий и ходов, provider/model config, resolver per-run/session/global; связывает Core с repository/provider/credential ports | `src/packages/application/` |
 | Core | Типы сообщений и provider-agnostic agent runtime, проверки tool calls и разрешений | `src/packages/core/` |
-| Providers | Адаптеры Fake и LM Studio к контракту Core | `src/packages/providers/` |
-| Storage | SQLite repository, JSON import и формат сохранённых сессий/runs | `src/packages/storage/` |
+| Providers | Fake, общий OpenAI-compatible Chat Completions adapter и LM Studio compatibility wrapper; macOS Keychain adapter | `src/packages/providers/` |
+| Storage | SQLite schema v2 с providers/models/selections и run snapshots, JSON import и формат сохранённых сессий/runs | `src/packages/storage/` |
 
 ```mermaid
 flowchart LR
@@ -133,14 +142,21 @@ flowchart LR
   Host -->|use cases| App["Application API"]
   CLI["CLI host"] -->|те же use cases напрямую| App
   App -->|запуск хода| Core["Core Agent Runtime"]
-  App -->|сессии, сообщения и runs| Repo["ApplicationRepository"]
-  Core -->|внутренний контракт модели| Provider["Fake / LM Studio"]
-  Repo --> Storage["SQLite store.sqlite"]
+  App -->|сессии, сообщения, runs и конфигурация моделей| Repo["SQLite repository"]
+  Core -->|TextGenerationProvider port| Provider["Модельный adapter"]
+  Fake["Fake Provider"] -. "implements" .-> Provider
+  OpenAI["Shared OpenAI-compatible adapter"] -. "implements" .-> Provider
+  LMWrapper["LM Studio compatibility wrapper"] -. "implements" .-> Provider
+  App -->|credential reference| Vault["macOS Keychain"]
+  Repo --> Storage["SQLite schema v2"]
 ```
 
 ## Текущее поведение и ограничения
 
 - Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и потоковый `POST /api/sessions/:id/messages/stream`.
+- Provider/model management routes позволяют сохранить endpoint, протестировать его, открыть `/models`, добавить manual ID и выбрать session/global model. Они принимают только loopback Host/same-host Origin, CORS не включён; test/discovery используют provider ID из сохранённой конфигурации.
+- `/models` показывает доступные IDs, но не доказывает поддержку reasoning, tools или streaming. Такие capabilities начинаются с `unknown`. Один Application resolver создаёт зафиксированный provider для каждого нового Run; completed snapshot остаётся в истории после редактирования catalog.
+- SQLite schema v1 мигрирует транзакционно в v2. API key записывается в macOS Keychain; SQLite хранит только ссылку, Web API — только признак наличия. На других платформах plaintext fallback нет.
 - Web UI использует streaming route для текста и reasoning deltas. После успешного завершения SQLite сохраняет отдельно assistant message и ordered AgentRun trace с model calls, полным reasoning и выполненными tool calls; вкладки «Чат» и «История» восстанавливают шаги из history API.
 - Web host может подключить `demo.add`; UI передаёт его только при явном разрешении для текущего хода. CLI также требует отдельные флаги подключения и разрешения инструмента.
 - Streaming ход сохраняет user message до генерации, а assistant message вместе с completed trace — одной транзакцией после успешного ответа. Отмена или ошибка не сохраняют частичный ответ или completed trace; active inference и event replay не восстанавливаются после reload.
@@ -153,9 +169,10 @@ flowchart LR
 - HTTP-вызовы и обработка SSE в браузере — `src/apps/web/src/api.ts`.
 - HTTP-маршруты, SSE-события и отмена запроса — `src/apps/web-host/server.ts`.
 - Конфигурация host, provider и repository — `src/apps/web-host/main.ts`.
+- Use cases provider/model catalog, discovery, credential resolution и выбора для нового хода — `src/packages/application/provider-configuration.ts`.
 - Порядок действий при отправке сообщения и сохранении хода — `src/packages/application/use-cases.ts`.
 - Агентный цикл, лимиты и исполнение tool calls — `src/packages/core/agent/runtime.ts`.
-- Контракт конкретной модели — соответствующий адаптер в `src/packages/providers/`.
-- Чтение и запись сессий — `src/packages/storage/` и `src/packages/application/ports.ts`.
+- Общий OpenAI-compatible inference/discovery contract и совместимость LM Studio — `src/packages/providers/lm-studio-provider.ts`; credential vault — `src/packages/providers/macos-credential-store.ts`.
+- Чтение и запись сессий, provider/model configs и run snapshots — `src/packages/storage/sqlite-application-repository.ts` и `src/packages/application/ports.ts`.
 
 Подробные границы модулей и контракты описаны в [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) и [`docs/CONTRACTS.md`](../CONTRACTS.md). Команды разработки и полный локальный запуск приведены в [`README.md`](../../README.md).
