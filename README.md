@@ -45,6 +45,8 @@ npm run --prefix src/apps/web dev
 
 Чаты, сообщения и завершённые run traces хранятся в SQLite: по умолчанию это `.smys-agent/store.sqlite` относительно каталога запуска host. `SMYS_DATA_DIR` задаёт общий каталог для Web и CLI. API keys хранятся отдельно в macOS Keychain, в SQLite лежат только ссылки на них.
 
+Настроенные providers и models тоже сохраняются в этой SQLite базе (`provider_configs` и `model_configs`). Основной интерфейс управления — Web UI; отдельных CLI-команд для добавления или редактирования каталога нет. Для локальных скриптов доступны management routes Web API, например `POST /api/providers`, `POST /api/models`, test и discovery routes. Host должен быть запущен и принимает такие запросы только через loopback; если запрос содержит `Origin`, он должен совпадать с loopback host. CORS выключен. Для API key используйте этот API, чтобы host передал secret в Keychain; не записывайте его вручную в SQLite. Маршруты перечислены в [контрактах](docs/CONTRACTS.md).
+
 При первом создании SQLite-хранилища SMYS однократно импортирует существующий legacy `store.json` формата v1/v2/v3 и сохраняет рядом исходный файл как `store.json.vN.sqlite.bak`. Это миграция старого формата, а не общий импорт чатов. Полноценного импорта/экспорта всех чатов через UI или CLI пока нет.
 
 Можно вывести сообщения одной сессии в JSON и перенаправить их в файл:
