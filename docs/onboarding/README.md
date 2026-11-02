@@ -17,9 +17,9 @@ npm run web:host
 npm run --prefix src/apps/web dev
 ```
 
-Откройте адрес, который напечатает Vite. Fake provider используется по умолчанию. Для LM Studio задайте `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint задаётся через `LM_STUDIO_ENDPOINT`, а токен — через `LM_API_TOKEN`. Каталог JSON-хранилища можно изменить через `SMYS_DATA_DIR`.
+Откройте адрес, который напечатает Vite. Fake provider используется по умолчанию. Для LM Studio задайте `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint задаётся через `LM_STUDIO_ENDPOINT`, а токен — через `LM_API_TOKEN`. Каталог SQLite-хранилища можно изменить через `SMYS_DATA_DIR`.
 
-Vite проксирует `/api` в `http://127.0.0.1:3001`. Адрес API можно переопределить через `SMYS_API_URL`, порт host — через `SMYS_WEB_PORT`. Host слушает только loopback-интерфейс. Пока он работает, CLI и другие процессы не должны параллельно записывать в тот же JSON store.
+Vite проксирует `/api` в `http://127.0.0.1:3001`. Адрес API можно переопределить через `SMYS_API_URL`, порт host — через `SMYS_WEB_PORT`. Host слушает только loopback-интерфейс. SQLite-транзакции защищают короткие операции записи между несколькими host/CLI процессами с одним каталогом данных; inference resource lock не реализован.
 
 ## Точки входа
 
@@ -63,7 +63,7 @@ flowchart TD
   State --> Panel
 ```
 
-При загрузке `App` запрашивает список сессий и выбирает первую, затем загружает её историю. Создание чата и отправка сообщения идут через `api.ts`. Во время генерации текст отображается из временного состояния; после успешного завершения UI добавляет сохранённые сообщения в историю и обновляет список сессий.
+При загрузке `App` запрашивает список сессий и выбирает первую, затем загружает её messages и completed runs через history API. Создание чата и отправка сообщения идут через `api.ts`. Во время генерации текст и reasoning отображаются из временного состояния; после успеха UI завершает live presentation. Persisted trace загружается history API при открытии или повторном открытии сессии и связывается по ID assistant message.
 
 ## Поток сообщения через HTTP, Application и Core
 
@@ -73,34 +73,46 @@ sequenceDiagram
   participant Adapter as api.ts
   participant Host as web-host
   participant App as Application
-  participant Repo as SessionRepository
+  participant Repo as ApplicationRepository
   participant Core as Core Agent Runtime
   participant Model as Provider
 
   UI->>Adapter: отправить текст
   Adapter->>Host: POST /api/sessions/:id/messages/stream
   Host->>Host: проверить запрос, создать runId и AbortController
-  Host->>App: runAgentTurnStreaming
+  Host->>App: executeTurn + event callback
   App->>Repo: сохранить user message
   App-->>Host: onStarted
   Host-->>Adapter: SSE turn.started
   App->>Repo: загрузить историю
-  App->>Core: streamAgentTurn(history)
-  Core->>Model: streamText(messages, tools=[])
-  loop Текстовые фрагменты
-    Model-->>Core: delta
-    Core-->>Host: onTextDelta callback через Application
-    Host-->>Adapter: SSE assistant.delta
-    Adapter-->>UI: обновить временный ответ
+  App->>Core: runAgentTurn(history, provider, tools, policy)
+  loop Model / reasoning / tool events
+    Core->>Model: generation request
+    Model-->>Core: text / reasoning / tool-call events
+    Core-->>App: AgentEvent
+    App-->>Host: event callback
+    Host-->>Adapter: SSE runtime event
+    Adapter-->>UI: обновить временные шаги и preview
   end
-  Core-->>App: полный текст
-  App->>Repo: сохранить assistant message
+  Core-->>App: финальный текст и собранный trace
+  App->>Repo: completeRun(assistant message + trace)
+  Repo->>Repo: SQLite transaction: message + run + ordered steps
   App-->>Host: завершённый ход
   Host-->>Adapter: SSE turn.completed
-  Adapter-->>UI: добавить сохранённые сообщения
+  Adapter-->>UI: завершить временное представление
+  opt Открытие сессии после reload
+    UI->>Adapter: GET /api/sessions/:id/history
+    Adapter->>Host: history request
+    Host->>App: getSessionTrajectory(sessionId)
+    App->>Repo: getHistory() + listCompletedRuns()
+    Repo-->>App: messages + ordered runs
+    App-->>Host: SessionTrajectory
+    Host-->>Adapter: JSON session, messages, runs
+    Adapter-->>UI: восстановить шаги по assistantMessageId
+  end
 ```
 
-При ошибке хода host передаёт `turn.failed`. При остановке UI вызывает `AbortController.abort()`; разрыв запроса доходит до host, Application, Core и provider. Частичный текст остаётся временным состоянием UI и в хранилище не записывается. Если генерация завершается ошибкой после сохранения user message, в истории остаётся это сообщение без ответа ассистента.
+При ошибке хода host передаёт `turn.failed`. При остановке UI вызывает `AbortController.abort()`; разрыв запроса доходит до host, Application, Core и provider. Частичный текст/reasoning остаётся временным состоянием UI и в хранилище не записывается. Если генерация завершается ошибкой после сохранения user message, в истории остаётся это сообщение без ответа ассистента и completed trace.
 
 ## Ответственность слоёв
 
@@ -112,7 +124,7 @@ sequenceDiagram
 | Application | Use cases сессий и ходов; связывает Core с repository/provider портами | `src/packages/application/` |
 | Core | Типы сообщений и provider-agnostic agent runtime, проверки tool calls и разрешений | `src/packages/core/` |
 | Providers | Адаптеры Fake и LM Studio к контракту Core | `src/packages/providers/` |
-| Storage | JSON repository и формат сохранённых сессий | `src/packages/storage/` |
+| Storage | SQLite repository, JSON import и формат сохранённых сессий/runs | `src/packages/storage/` |
 
 ```mermaid
 flowchart LR
@@ -121,19 +133,19 @@ flowchart LR
   Host -->|use cases| App["Application API"]
   CLI["CLI host"] -->|те же use cases напрямую| App
   App -->|запуск хода| Core["Core Agent Runtime"]
-  App -->|сессии и сообщения| Repo["SessionRepository"]
+  App -->|сессии, сообщения и runs| Repo["ApplicationRepository"]
   Core -->|внутренний контракт модели| Provider["Fake / LM Studio"]
-  Repo --> Storage["JSON storage"]
+  Repo --> Storage["SQLite store.sqlite"]
 ```
 
 ## Текущее поведение и ограничения
 
 - Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и потоковый `POST /api/sessions/:id/messages/stream`.
-- Web UI использует streaming route. В текущем Web-потоке доступны сохранённые текстовые сообщения и временный текстовый delta-поток. Tool calls, reasoning и runtime events не показываются в UI и не сохраняются как trajectory.
-- Core поддерживает ограниченный цикл с инструментом, но Web host не передаёт инструменты в вызовах хода. Streaming use case явно отклоняет настроенные инструменты. CLI может подключить `demo.add` отдельными флагами и разрешить его отдельным флагом.
-- Streaming ход сохраняет user message до генерации, а assistant message — только после полного успешного ответа. Отмена или ошибка не сохраняет частичный ответ.
-- UI группирует сессии под «Без проекта». Проекты и отдельный Desktop UI не реализованы. Вкладка «История» показывает сохранённые сообщения сессии, а не runtime trace.
-- Web host сериализует изменяющие запросы в одном процессе. Конкурентная запись из CLI или другого процесса в тот же JSON store не гарантируется.
+- Web UI использует streaming route для текста и reasoning deltas. После успешного завершения SQLite сохраняет отдельно assistant message и ordered AgentRun trace с model calls, полным reasoning и выполненными tool calls; вкладки «Чат» и «История» восстанавливают шаги из history API.
+- Web host может подключить `demo.add`; UI передаёт его только при явном разрешении для текущего хода. CLI также требует отдельные флаги подключения и разрешения инструмента.
+- Streaming ход сохраняет user message до генерации, а assistant message вместе с completed trace — одной транзакцией после успешного ответа. Отмена или ошибка не сохраняют частичный ответ или completed trace; active inference и event replay не восстанавливаются после reload.
+- UI группирует сессии под «Без проекта». Проекты и отдельный Desktop UI не реализованы. Старые сессии без traces продолжают открываться; legacy assistant reasoning остаётся доступен.
+- Web host сериализует изменяющие запросы в одном процессе. SQLite-транзакции защищают короткие записи нескольких host/CLI процессов с одним каталогом данных; inference resource lock не реализован.
 
 ## Куда идти за изменением
 

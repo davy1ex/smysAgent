@@ -1,6 +1,7 @@
 # ADR-0016: SQLite и trajectory завершённых AgentRun
 
 - Статус: Accepted
+- Реализация: Implemented (2026-11-02, commit `7def147`)
 - Дата: 2026-11-02
 - Утвердил: владелец проекта в чате
 
@@ -41,3 +42,9 @@ ADR-0015 выбрал поле `assistantMessage.reasoning` для узкой з
 - Перезапуск SQLite repository и Web Host сохраняет ровно один assistant message и связанные ordered trace steps.
 - Второй API client получает идентичные `messages` и `runs`; сессия без traces возвращает `runs: []`.
 - Сбой транзакции завершения не оставляет assistant message без trace.
+
+## Evidence реализации
+
+- Storage: [`sqlite-application-repository.ts`](../../src/packages/storage/sqlite-application-repository.ts); Application port и сбор trace: [`ports.ts`](../../src/packages/application/ports.ts), [`use-cases.ts`](../../src/packages/application/use-cases.ts).
+- History API и UI restore: [`server.ts`](../../src/apps/web-host/server.ts), [`App.tsx`](../../src/apps/web/src/App.tsx), [`turn-presentation.ts`](../../src/apps/web-ui/turn-presentation.ts).
+- Automated verification: 76 root tests и 3 Web tests passed; root build, typecheck, lint и Web production build passed. Отдельно проверен перезапуск Web Host и независимое browser/API чтение.
