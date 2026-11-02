@@ -1,5 +1,71 @@
 import type { AssistantMessage, AssistantReasoning, MessageId, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import type { AgentEventHandler, AgentTool, ToolPermissionPolicy } from "../core/agent";
+import type { TextGenerationProvider } from "../core/agent";
+
+export type ModelCapabilityStatus = "unknown" | "supported" | "unsupported";
+
+export interface ModelCapabilities {
+  streaming: ModelCapabilityStatus;
+  toolCalling: ModelCapabilityStatus;
+  reasoning: ModelCapabilityStatus;
+}
+
+export interface ProviderConfiguration {
+  id: string;
+  name: string;
+  protocol: "openai-chat-completions";
+  baseUrl: string;
+  credentialRef?: string;
+  allowInsecureHttp: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ModelConfiguration {
+  id: string;
+  providerId: string;
+  modelId: string;
+  displayName: string;
+  source: "discovered" | "manual";
+  capabilities: ModelCapabilities;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ModelSelectionSnapshot {
+  providerId: string;
+  providerName: string;
+  modelConfigId: string;
+  modelId: string;
+  modelName: string;
+}
+
+export interface ProviderConfigurationRepository {
+  listProviderConfigurations(): Promise<ProviderConfiguration[]>;
+  getProviderConfiguration(id: string): Promise<ProviderConfiguration | null>;
+  saveProviderConfiguration(configuration: ProviderConfiguration): Promise<void>;
+  deleteProviderConfiguration(id: string): Promise<boolean>;
+  listModelConfigurations(): Promise<ModelConfiguration[]>;
+  getModelConfiguration(id: string): Promise<ModelConfiguration | null>;
+  saveModelConfiguration(configuration: ModelConfiguration): Promise<void>;
+  deleteModelConfiguration(id: string): Promise<boolean>;
+  getDefaultModelConfigId(): Promise<string | null>;
+  getSessionModelConfigId(sessionId: SessionId): Promise<string | null>;
+  setDefaultModelConfigId(id: string | null): Promise<void>;
+  setSessionModelConfigId(sessionId: SessionId, id: string | null): Promise<boolean>;
+}
+
+export interface CredentialStore {
+  save(reference: string, secret: string): Promise<void>;
+  get(reference: string): Promise<string | null>;
+  delete(reference: string): Promise<void>;
+}
+
+export interface OpenAICompatibleProviderFactory {
+  create(input: { baseUrl: string; modelId: string; apiToken?: string }): TextGenerationProvider;
+  testConnection(input: { baseUrl: string; apiToken?: string }): Promise<"connected" | "discovery-unavailable">;
+  discoverModels(input: { baseUrl: string; apiToken?: string }): Promise<string[]>;
+}
 
 export interface AgentExecutionOptions {
   tools?: readonly AgentTool[];
@@ -44,6 +110,7 @@ export interface CompletedAgentRun {
   startedAt: string;
   completedAt: string;
   steps: AgentRunStep[];
+  modelSelection?: ModelSelectionSnapshot;
 }
 
 export interface AgentRunRepository {

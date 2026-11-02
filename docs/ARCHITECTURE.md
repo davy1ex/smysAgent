@@ -1,6 +1,6 @@
 # Architecture
 
-**Статус:** документ разделяет текущую реализацию и целевые направления. Внутренний application API и headless-first вход утверждены в ADR-0001; единое исполнение хода — в ADR-0012. Целевые схемы ниже не означают, что описанные модули, пути или контракты уже реализованы.
+**Статус:** документ разделяет текущую реализацию и целевые направления. Внутренний application API и headless-first вход утверждены в ADR-0001; единое исполнение хода — в ADR-0012; пользовательская конфигурация OpenAI-compatible providers/models — в ADR-0017. Целевые схемы ниже не означают, что описанные модули, пути или контракты уже реализованы.
 
 ## Текущая реализация
 
@@ -13,8 +13,8 @@ flowchart LR
   VITE["Vite dev server<br/>assets + /api proxy"] -->|"загружает UI"| WEBUI["React Web UI<br/>browser"]
   WEBUI -->|"HTTP + SSE"| WEBHOST["Web API host<br/>Node · 127.0.0.1"]
   subgraph APPLICATION["Application package"]
-    APP["Application API<br/>sessions · turns · history"]
-    PORT["ApplicationRepository port<br/>SessionRepository + AgentRunRepository"]
+    APP["Application API<br/>sessions · turns · provider/model config"]
+    PORT["Application ports<br/>repositories · credentials · provider factory"]
   end
   CLI["CLI host<br/>src/apps/cli"] -->|"in-process use cases"| APP
   WEBHOST -->|"in-process use cases"| APP
@@ -22,10 +22,11 @@ flowchart LR
   APP -->|"read / write"| PORT
 
   STORAGE["SqliteApplicationRepository<br/>src/packages/storage"] -. "implements" .-> PORT
-  STORAGE --> DB[("store.sqlite<br/>sessions · messages · runs · steps")]
+  STORAGE --> DB[("store.sqlite · schema v2<br/>sessions · messages · runs · provider/model config")]
   JSON["Legacy store.json<br/>v1 / v2 / v3"] -. "one-time import" .-> STORAGE
   CORE --> PROVIDER_PORT["TextGenerationProvider port"]
-  PROVIDER["Fake / LM Studio adapters"] -. "implement" .-> PROVIDER_PORT
+  PROVIDER["Fake / shared OpenAI-compatible adapter<br/>LM Studio compatibility wrapper"] -. "implement" .-> PROVIDER_PORT
+  VAULT["macOS Keychain<br/>provider API keys"] -. "credential reference" .-> APP
   CORE --> TOOL["Registered tools<br/>permission policy"]
 ```
 
@@ -36,16 +37,16 @@ src/apps/cli/{main,smoke-lm-studio}.ts
 src/apps/web-host/{main,server}.ts    # локальный HTTP host поверх Application API
 src/apps/web/                         # React/Vite клиент с HTTP adapter
 src/apps/web-ui/turn-presentation.ts  # reducer временного event state для Web UI
-src/packages/application/{demo-tools,errors,index,ports,use-cases}.ts
+src/packages/application/{demo-tools,errors,index,ports,provider-configuration,use-cases}.ts
 src/packages/core/agent/{errors,index,model,runtime,tool}.ts
 src/packages/core/session.ts
-src/packages/providers/{fake-provider,lm-studio-provider}.ts
+src/packages/providers/{fake-provider,lm-studio-provider,macos-credential-store}.ts
 src/packages/storage/{errors,index,json-file-session-repository,sqlite-application-repository,store-format}.ts
 src/tests/{application,cli,providers,storage,web,web-host}/
 docs/
 ```
 
-`src/apps/web` показывает сессии, сообщения и completed traces из Application API. Vite проксирует `/api` в `src/apps/web-host`; host вызывает `executeTurn()` и выбирает Fake или LM Studio. Chat размещает status, reasoning/tool events и assistant draft в порядке текущего хода; History раскрывает сохранённые model/tool шаги подробнее. После успешного завершения Application сохраняет полный ordered trace отдельно от assistant message; история и связанные runs загружаются вместе. Web UI предлагает явный checkbox для grant `demo.add` на один ход. Проекты пока не реализованы: группа сессий называется «Без проекта». JSON v1/v2/v3 импортируется в SQLite один раз; повторный запуск Web Host использует существующую БД. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
+`src/apps/web` показывает сессии, сообщения и completed traces из Application API, а также каталог providers/models и выбор модели для сессии. Vite проксирует `/api` в `src/apps/web-host`; host вызывает `executeTurn()` с провайдером, разрешённым Application для нового хода. Fake и legacy env-настройки остаются fallback; пользовательские OpenAI-compatible endpoints используют один Chat Completions adapter, а LM Studio сохраняет совместимый wrapper. Chat размещает status, reasoning/tool events и assistant draft в порядке текущего хода; History раскрывает сохранённые model/tool шаги подробнее. После успешного завершения Application сохраняет ordered trace и фактический provider/model snapshot отдельно от assistant message. API keys хранятся в macOS Keychain; SQLite хранит только opaque reference, браузер получает только признак наличия ключа. Web UI предлагает явный checkbox для grant `demo.add` на один ход. Проекты пока не реализованы: группа сессий называется «Без проекта». JSON v1/v2/v3 импортируется в SQLite один раз; повторный запуск Web Host использует существующую БД. Детали API, ошибок и формата данных находятся в [CONTRACTS.md](CONTRACTS.md).
 
 ## Целевая модель
 
@@ -62,7 +63,7 @@ flowchart TB
   SQLITE_ADAPTER["SQLite storage adapter"] -. "implements" .-> PORT
   SQLITE_ADAPTER --> SQLITE[("SQLite store")]
   CORE --> PROVIDER_PORT["TextGenerationProvider port"]
-  PROVIDERS["Provider adapters<br/>Fake, LM Studio"] -. "implement" .-> PROVIDER_PORT
+  PROVIDERS["Provider adapters<br/>Fake, OpenAI-compatible<br/>LM Studio wrapper"] -. "implement" .-> PROVIDER_PORT
   CORE --> TOOLS["Tool execution<br/>permission policy"]
   DESKTOP["Desktop UI · будущее"]
 ```
@@ -98,13 +99,13 @@ flowchart TB
 | --- | --- | --- |
 | Desktop UI (будущее, `src/apps/desktop`) | Отображение состояния; пользовательский ввод; отправку команд | Внутренности цикла агента, SQL и формат API конкретной модели |
 | Web UI (`src/apps/web`, `src/apps/web-ui`) | Отображение сессий, сообщений и run state; пользовательский ввод; HTTP/SSE-запросы | Application/Core imports, provider config, storage schema и выдуманные runtime events |
-| Web host (`src/apps/web-host`) | HTTP transport, provider/data-dir config, сериализация изменяющих запросов | Собственный agent loop и UI-компоненты |
+| Web host (`src/apps/web-host`) | HTTP transport, legacy env/data-dir config, local-origin checks, сериализация изменяющих запросов | Собственный agent loop и UI-компоненты |
 | CLI (`src/apps/cli`) | Headless-команды, скриптовое управление, структурированный вывод и коды завершения | Собственную реализацию agent loop, прямое управление БД и обход проверок разрешений |
-| Application API (`src/packages/application`) | Сессии, сообщения, completed turns и trajectory; связывание входов с runtime и repository ports | UI-компоненты, транспорт HTTP и детали сетевого протокола провайдера |
+| Application API (`src/packages/application`) | Сессии, сообщения, completed turns и trajectory; provider/model configuration use cases; разрешение модели перед Run и связывание входов с runtime/ports | UI-компоненты, транспорт HTTP и детали сетевого протокола провайдера |
 | Core / Agent Runtime | Ход сессии, сбор контекста, ответы модели, вызовы инструментов, события и отмена | React, SQLite, OpenRouter, YouTube и другие конкретные адаптеры |
-| Providers | Преобразование внутреннего запроса в формат модели и нормализация ответа обратно | UI, хранение чатов и бизнес-логика приложения |
+| Providers | Преобразование внутреннего запроса в формат модели и нормализация ответа обратно; общий OpenAI-compatible adapter и credential vault adapter | UI, хранение чатов и бизнес-логика приложения |
 | Tools | Регистрация и выполнение инструментов; проверка разрешений до побочного эффекта | Представление UI и внутренний формат API модели |
-| Storage (`src/packages/storage`) | Сохранение sessions/messages/runs в SQLite; schema init и однократный JSON import | Правила цикла агента и детали провайдеров |
+| Storage (`src/packages/storage`) | Сохранение sessions/messages/runs и provider/model configuration в SQLite; schema init и однократный JSON import | Правила цикла агента и детали провайдеров |
 | Knowledge | Получение и поиск источников, выдача контекста и ссылок/цитат | Внутренности UI и конкретная реализация agent loop |
 
 ## Целевое направление зависимостей
@@ -120,12 +121,12 @@ flowchart TB
 
 ## Application API и входы: текущее и будущее
 
-Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `executeTurn`, `getHistory` и `getSessionTrajectory`. `executeTurn` принимает составной `ApplicationRepository`, который объединяет message/session и AgentRun ports; только завершённый ход атомарно сохраняет assistant message и trace. Внутренний API можно вызывать напрямую с fake provider и тестовым хранилищем. `executeTurn` принимает необязательный `AbortSignal` и callback событий/текстовых дельт, оставляя совместимые делегаты `runAgentTurn` и `runAgentTurnStreaming`. `createProject` и `replaySession` не реализованы.
+Текущий `src/packages/application` предоставляет `createSession`, `listSessions`, `sendMessage`, `executeTurn`, `getHistory`, `getSessionTrajectory` и use cases каталога/сохранения providers и models, проверки endpoint/discovery, выбора global/session model и разрешения provider перед новым Run. Session model selection хранится как Application configuration metadata и не входит в Core `Session`. `executeTurn` принимает составной `ApplicationRepository`, который объединяет message/session и AgentRun ports; только завершённый ход атомарно сохраняет assistant message, trace и snapshot разрешённого provider/model. Внутренний API можно вызывать напрямую с fake provider и тестовым хранилищем. `executeTurn` принимает необязательный `AbortSignal` и callback событий/текстовых дельт, оставляя совместимые делегаты `runAgentTurn` и `runAgentTurnStreaming`. `createProject` и `replaySession` не реализованы.
 
 - CLI — headless host для создания сессий, отправки сообщений и чтения истории. Он вызывает `executeTurn`, поддерживает прежний JSON-контракт, text streaming, NDJSON и стабильные коды завершения, включая отмену по SIGINT.
 - Web host предоставляет `GET /api/sessions`, `POST /api/sessions`, `GET /api/sessions/:id/history`, `POST /api/sessions/:id/messages` и `POST /api/sessions/:id/messages/stream`. Оба изменяющих маршрута используют `executeTurn`; SSE отображает общий список событий и передаёт отмену provider.
 - В Web тело хода может явно включить `allowTools: ["demo.add"]`. Пустой или отсутствующий grant оставляет runtime без инструментов; UI сбрасывает checkbox после отправки.
-- Web host по умолчанию использует Fake provider; LM Studio настраивается переменными окружения. Host слушает `127.0.0.1`, а Vite проксирует браузерные API-запросы.
+- Web host использует Application resolver с приоритетом per-run → session → global model. Если пользовательский выбор отсутствует, применяется legacy env provider; без него используется Fake. Host слушает `127.0.0.1`, проверяет loopback Host/same-host Origin для API и не включает CORS; Vite проксирует браузерные запросы.
 - Worker отложен до фонового сценария. Он должен вызывать те же use cases, а не реализовывать собственный цикл агента.
 - Сейчас есть unit/integration-тесты application, storage и providers, а также CLI process-тесты. CLI проверяет реальный процесс и постоянное хранилище между запусками.
 - SQLite transaction атомарно связывает финальное assistant message с завершённым trace; `busy_timeout` обслуживает короткую конкуренцию записей между процессами. Координация inference resource и продолжение активного хода не реализованы.
@@ -148,7 +149,7 @@ application сохраняет user message
 
 Application `executeTurn` сохраняет user message, передаёт историю единому runtime и после успешного завершения атомарно сохраняет финальный assistant message вместе с completed trace. Trace хранит упорядоченные model, canonical reasoning и tool steps; reasoning хранится отдельно от текста assistant message. Web и CLI также получают совместимую агрегированную строку reasoning. Через `AgentEvent` Runtime сообщает границы model calls, per-call `reasoning.delta` во время provider stream, canonical `reasoning.completed` по завершении вызова, запрос инструмента, начало разрешённого исполнения, результат инструмента и текстовые дельты. Application сообщает `turn.started` после записи user message, `turn.completed` после транзакции сообщения и trace, `turn.failed` при ошибке. Полные reasoning и tool arguments/results хранятся только в успешном run; stream deltas и failed/cancelled runs не сохраняются. При ошибке или отмене остаётся пользовательское сообщение без финального ответа; клиент может показать реально полученные partial reasoning/text deltas. Fake provider проверяет один и тот же цикл через CLI и Web. LM Studio преобразует stream tool-call fragments и промежуточную пару assistant/tool. CLI подключает `demo.add` флагами; Web получает его только с одноразовым явным `allowTools` grant.
 
-SQLite schema v1 хранит sessions, messages, completed runs и упорядоченные steps. При первом открытии новая БД импортирует JSON v1/v2/v3; оригинальные bytes сохраняются в `store.json.vN.sqlite.bak`. Импорт сохраняет прежние IDs, sequence и legacy reasoning, но не выдумывает traces для старых runs. Неизвестный, повреждённый JSON и неизвестная schema version отклоняются без автоматического сброса. SQLite database имеет права файла `0600`; полный reasoning и tool payload остаются локальными без шифрования и маскирования.
+SQLite schema v2 хранит sessions, messages, completed runs и упорядоченные steps, provider/model configs и selection metadata. Schema v1 транзакционно мигрирует в v2; при первом открытии новая БД импортирует JSON v1/v2/v3 сразу в актуальную схему, оригинальные bytes сохраняются в `store.json.vN.sqlite.bak`. Импорт сохраняет прежние IDs, sequence и legacy reasoning, но не выдумывает traces для старых runs. Неизвестный, повреждённый JSON и неизвестная schema version отклоняются без автоматического сброса. SQLite database имеет права файла `0600`; полный reasoning и tool payload остаются локальными без шифрования и маскирования. API key хранится отдельно в macOS Keychain; в SQLite записывается только ссылка, а на неподдерживаемой платформе нет plaintext fallback.
 
 ## Record/replay (целевое направление, не реализовано)
 
@@ -156,7 +157,7 @@ SQLite schema v1 хранит sessions, messages, completed runs и упоряд
 
 ## Проверки и целевые уровни
 
-Текущий набор содержит application use-case, SQLite storage, provider, CLI process, Web API и Web UI tests. Последняя проверка 2026-11-02: 76 root tests и 3 Web tests прошли; также прошли root build, typecheck, lint и Web production build. Для детерминированного набора live model не требуется; provider smoke tests выполняются отдельно.
+Текущий набор содержит application use-case, SQLite storage, provider, CLI process, Web API и Web UI tests. Последняя проверка 2026-11-02: 85 root tests и 3 Web tests прошли; также прошли root build/typecheck, lint и Web production build. Provider-config tests покрывают migration, discovery с неизвестными capabilities, credential masking, precedence, configuration reopen и один SQLite source для CLI/Web; детерминированному набору live model не требуется.
 
 | Уровень | Пример проверки |
 | --- | --- |

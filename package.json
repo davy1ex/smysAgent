@@ -25,6 +25,7 @@
     "typescript-eslint": "^8.72.1"
   },
   "dependencies": {
+    "@napi-rs/keyring": "2.1.2",
     "better-sqlite3": "12.9.0"
   }
 }

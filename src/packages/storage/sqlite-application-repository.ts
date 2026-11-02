@@ -6,6 +6,9 @@ import type {
   ApplicationRepository,
   AssistantMessageDraft,
   CompletedAgentRun,
+  ModelConfiguration,
+  ProviderConfiguration,
+  ProviderConfigurationRepository,
   UserMessageDraft,
 } from "../application/ports";
 import type {
@@ -28,7 +31,7 @@ import {
   type StoreDocument,
 } from "./store-format";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 interface SessionRow {
   id: string;
@@ -54,6 +57,33 @@ interface RunRow {
   assistant_message_id: string;
   started_at: string;
   completed_at: string;
+  provider_id: string | null;
+  provider_name: string | null;
+  model_config_id: string | null;
+  model_id: string | null;
+  model_name: string | null;
+}
+
+interface ModelConfigurationRow {
+  id: string;
+  provider_id: string;
+  model_id: string;
+  display_name: string;
+  source: "discovered" | "manual";
+  capabilities_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ProviderConfigurationRow {
+  id: string;
+  name: string;
+  protocol: "openai-chat-completions";
+  base_url: string;
+  credential_ref: string | null;
+  allow_insecure_http: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface StepRow {
@@ -61,7 +91,7 @@ interface StepRow {
   step_json: string;
 }
 
-export class SqliteApplicationRepository implements ApplicationRepository {
+export class SqliteApplicationRepository implements ApplicationRepository, ProviderConfigurationRepository {
   private readonly database: Database.Database;
   private closed = false;
 
@@ -93,7 +123,7 @@ export class SqliteApplicationRepository implements ApplicationRepository {
   async createSession(session: Session): Promise<void> {
     this.ensureOpen();
     try {
-      this.database.prepare("INSERT INTO sessions (id, created_at, extra_json) VALUES (?, ?, ?)")
+      this.database.prepare("INSERT INTO sessions (id, created_at, selected_model_config_id, extra_json) VALUES (?, ?, NULL, ?)")
         .run(session.id, session.createdAt, stringifyExtra(session, ["id", "createdAt"]));
     } catch (error) {
       throw storageFailure("Could not create the session.", error);
@@ -144,9 +174,22 @@ export class SqliteApplicationRepository implements ApplicationRepository {
         const message = this.insertMessage(run.sessionId, assistantMessage, "assistant");
         this.database.prepare(`
           INSERT INTO agent_runs
-            (id, session_id, user_message_id, assistant_message_id, status, started_at, completed_at)
-          VALUES (?, ?, ?, ?, 'completed', ?, ?)
-        `).run(run.id, run.sessionId, run.userMessageId, message.id, run.startedAt, run.completedAt);
+            (id, session_id, user_message_id, assistant_message_id, status, started_at, completed_at,
+             provider_id, provider_name, model_config_id, model_id, model_name)
+          VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          run.id,
+          run.sessionId,
+          run.userMessageId,
+          message.id,
+          run.startedAt,
+          run.completedAt,
+          run.modelSelection?.providerId ?? null,
+          run.modelSelection?.providerName ?? null,
+          run.modelSelection?.modelConfigId ?? null,
+          run.modelSelection?.modelId ?? null,
+          run.modelSelection?.modelName ?? null,
+        );
 
         const insertStep = this.database.prepare(
           "INSERT INTO agent_run_steps (run_id, ordinal, step_json) VALUES (?, ?, ?)",
@@ -168,7 +211,8 @@ export class SqliteApplicationRepository implements ApplicationRepository {
     this.ensureOpen();
     try {
       const rows = this.database.prepare(`
-        SELECT r.id, r.session_id, r.user_message_id, r.assistant_message_id, r.started_at, r.completed_at
+        SELECT r.id, r.session_id, r.user_message_id, r.assistant_message_id, r.started_at, r.completed_at,
+          r.provider_id, r.provider_name, r.model_config_id, r.model_id, r.model_name
         FROM agent_runs r
         JOIN messages m ON m.id = r.user_message_id
         WHERE r.session_id = ? AND r.status = 'completed'
@@ -188,6 +232,15 @@ export class SqliteApplicationRepository implements ApplicationRepository {
           startedAt: row.started_at,
           completedAt: row.completed_at,
           steps,
+          ...(row.provider_id === null || row.provider_name === null || row.model_config_id === null || row.model_id === null || row.model_name === null
+            ? {}
+            : { modelSelection: {
+              providerId: row.provider_id,
+              providerName: row.provider_name,
+              modelConfigId: row.model_config_id,
+              modelId: row.model_id,
+              modelName: row.model_name,
+            } }),
         };
       });
     } catch (error) {
@@ -211,6 +264,190 @@ export class SqliteApplicationRepository implements ApplicationRepository {
     if (this.closed) return;
     this.closed = true;
     this.database.close();
+  }
+
+  async listProviderConfigurations(): Promise<ProviderConfiguration[]> {
+    this.ensureOpen();
+    try {
+      const rows = this.database.prepare(`
+        SELECT id, name, protocol, base_url, credential_ref, allow_insecure_http, created_at, updated_at
+        FROM provider_configs ORDER BY name COLLATE NOCASE, id
+      `).all() as ProviderConfigurationRow[];
+      return rows.map(providerConfigurationFromRow);
+    } catch (error) {
+      throw storageFailure("Could not list provider configurations.", error);
+    }
+  }
+
+  async getProviderConfiguration(id: string): Promise<ProviderConfiguration | null> {
+    this.ensureOpen();
+    try {
+      const row = this.database.prepare(`
+        SELECT id, name, protocol, base_url, credential_ref, allow_insecure_http, created_at, updated_at
+        FROM provider_configs WHERE id = ?
+      `).get(id) as ProviderConfigurationRow | undefined;
+      return row === undefined ? null : providerConfigurationFromRow(row);
+    } catch (error) {
+      throw storageFailure("Could not read provider configuration.", error);
+    }
+  }
+
+  async saveProviderConfiguration(configuration: ProviderConfiguration): Promise<void> {
+    this.ensureOpen();
+    try {
+      this.database.prepare(`
+        INSERT INTO provider_configs (id, name, protocol, base_url, credential_ref, allow_insecure_http, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          protocol = excluded.protocol,
+          base_url = excluded.base_url,
+          credential_ref = excluded.credential_ref,
+          allow_insecure_http = excluded.allow_insecure_http,
+          updated_at = excluded.updated_at
+      `).run(
+        configuration.id,
+        configuration.name,
+        configuration.protocol,
+        configuration.baseUrl,
+        configuration.credentialRef ?? null,
+        configuration.allowInsecureHttp ? 1 : 0,
+        configuration.createdAt,
+        configuration.updatedAt,
+      );
+    } catch (error) {
+      throw storageFailure("Could not save provider configuration.", error);
+    }
+  }
+
+  async deleteProviderConfiguration(id: string): Promise<boolean> {
+    this.ensureOpen();
+    try {
+      return this.database.transaction(() => {
+        const models = this.database.prepare("SELECT id FROM model_configs WHERE provider_id = ?").all(id) as Array<{ id: string }>;
+        const removeDefault = this.database.prepare("DELETE FROM app_metadata WHERE key = 'default_model_config_id' AND value_json = ?");
+        for (const model of models) removeDefault.run(JSON.stringify(model.id));
+        return this.database.prepare("DELETE FROM provider_configs WHERE id = ?").run(id).changes > 0;
+      }).immediate();
+    } catch (error) {
+      throw storageFailure("Could not delete provider configuration.", error);
+    }
+  }
+
+  async listModelConfigurations(): Promise<ModelConfiguration[]> {
+    this.ensureOpen();
+    try {
+      const rows = this.database.prepare(`
+        SELECT id, provider_id, model_id, display_name, source, capabilities_json, created_at, updated_at
+        FROM model_configs ORDER BY display_name COLLATE NOCASE, id
+      `).all() as ModelConfigurationRow[];
+      return rows.map(modelConfigurationFromRow);
+    } catch (error) {
+      throw storageFailure("Could not list model configurations.", error);
+    }
+  }
+
+  async getModelConfiguration(id: string): Promise<ModelConfiguration | null> {
+    this.ensureOpen();
+    try {
+      const row = this.database.prepare(`
+        SELECT id, provider_id, model_id, display_name, source, capabilities_json, created_at, updated_at
+        FROM model_configs WHERE id = ?
+      `).get(id) as ModelConfigurationRow | undefined;
+      return row === undefined ? null : modelConfigurationFromRow(row);
+    } catch (error) {
+      throw storageFailure("Could not read model configuration.", error);
+    }
+  }
+
+  async saveModelConfiguration(configuration: ModelConfiguration): Promise<void> {
+    this.ensureOpen();
+    try {
+      this.database.prepare(`
+        INSERT INTO model_configs (id, provider_id, model_id, display_name, source, capabilities_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          provider_id = excluded.provider_id,
+          model_id = excluded.model_id,
+          display_name = excluded.display_name,
+          source = excluded.source,
+          capabilities_json = excluded.capabilities_json,
+          updated_at = excluded.updated_at
+      `).run(
+        configuration.id,
+        configuration.providerId,
+        configuration.modelId,
+        configuration.displayName,
+        configuration.source,
+        JSON.stringify(configuration.capabilities),
+        configuration.createdAt,
+        configuration.updatedAt,
+      );
+    } catch (error) {
+      throw storageFailure("Could not save model configuration.", error);
+    }
+  }
+
+  async deleteModelConfiguration(id: string): Promise<boolean> {
+    this.ensureOpen();
+    try {
+      return this.database.transaction(() => {
+        this.database.prepare("DELETE FROM app_metadata WHERE key = 'default_model_config_id' AND value_json = ?")
+          .run(JSON.stringify(id));
+        return this.database.prepare("DELETE FROM model_configs WHERE id = ?").run(id).changes > 0;
+      }).immediate();
+    } catch (error) {
+      throw storageFailure("Could not delete model configuration.", error);
+    }
+  }
+
+  async getDefaultModelConfigId(): Promise<string | null> {
+    this.ensureOpen();
+    try {
+      const row = this.database.prepare("SELECT value_json FROM app_metadata WHERE key = 'default_model_config_id'")
+        .get() as { value_json: string } | undefined;
+      if (row === undefined) return null;
+      const value = JSON.parse(row.value_json) as unknown;
+      return typeof value === "string" ? value : null;
+    } catch (error) {
+      throw storageFailure("Could not read the default model selection.", error);
+    }
+  }
+
+  async setDefaultModelConfigId(id: string | null): Promise<void> {
+    this.ensureOpen();
+    try {
+      if (id !== null && this.database.prepare("SELECT 1 FROM model_configs WHERE id = ?").get(id) === undefined) {
+        throw new StorageError("The default model configuration does not exist.");
+      }
+      this.database.prepare(`
+        INSERT INTO app_metadata (key, value_json) VALUES ('default_model_config_id', ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+      `).run(JSON.stringify(id));
+    } catch (error) {
+      throw storageFailure("Could not save the default model selection.", error);
+    }
+  }
+
+  async getSessionModelConfigId(sessionId: SessionId): Promise<string | null> {
+    this.ensureOpen();
+    try {
+      const row = this.database.prepare("SELECT selected_model_config_id FROM sessions WHERE id = ?")
+        .get(sessionId) as { selected_model_config_id: string | null } | undefined;
+      return row?.selected_model_config_id ?? null;
+    } catch (error) {
+      throw storageFailure("Could not read the session model selection.", error);
+    }
+  }
+
+  async setSessionModelConfigId(sessionId: SessionId, id: string | null): Promise<boolean> {
+    this.ensureOpen();
+    try {
+      return this.database.prepare("UPDATE sessions SET selected_model_config_id = ? WHERE id = ?")
+        .run(id, sessionId).changes > 0;
+    } catch (error) {
+      throw storageFailure("Could not save the session model selection.", error);
+    }
   }
 
   private async appendMessage(
@@ -267,6 +504,45 @@ export class SqliteApplicationRepository implements ApplicationRepository {
   private initialize(database: Database.Database, dataDir: string, jsonPath: string): void {
     const versionRow = database.pragma("user_version", { simple: true }) as number;
     if (versionRow === SCHEMA_VERSION) return;
+    if (versionRow === 1) {
+      try {
+        database.transaction(() => {
+          database.exec(`
+            CREATE TABLE provider_configs (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
+              protocol TEXT NOT NULL CHECK (protocol = 'openai-chat-completions'),
+              base_url TEXT NOT NULL,
+              credential_ref TEXT,
+              allow_insecure_http INTEGER NOT NULL CHECK (allow_insecure_http IN (0, 1)),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE model_configs (
+              id TEXT PRIMARY KEY,
+              provider_id TEXT NOT NULL REFERENCES provider_configs(id) ON DELETE CASCADE,
+              model_id TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              source TEXT NOT NULL CHECK (source IN ('discovered', 'manual')),
+              capabilities_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (provider_id, model_id)
+            );
+            ALTER TABLE sessions ADD COLUMN selected_model_config_id TEXT REFERENCES model_configs(id) ON DELETE SET NULL;
+            ALTER TABLE agent_runs ADD COLUMN provider_id TEXT;
+            ALTER TABLE agent_runs ADD COLUMN provider_name TEXT;
+            ALTER TABLE agent_runs ADD COLUMN model_config_id TEXT;
+            ALTER TABLE agent_runs ADD COLUMN model_id TEXT;
+            ALTER TABLE agent_runs ADD COLUMN model_name TEXT;
+            PRAGMA user_version = ${SCHEMA_VERSION};
+          `);
+        }).immediate();
+        return;
+      } catch (error) {
+        throw storageFailure("Could not migrate the SQLite data store to schema v2.", error);
+      }
+    }
     if (versionRow !== 0) throw new StorageError(`Unsupported SQLite schema version: ${versionRow}.`);
     const userTables = database.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -287,9 +563,31 @@ export class SqliteApplicationRepository implements ApplicationRepository {
     try {
       database.transaction(() => {
         database.exec(`
+          CREATE TABLE provider_configs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
+            protocol TEXT NOT NULL CHECK (protocol = 'openai-chat-completions'),
+            base_url TEXT NOT NULL,
+            credential_ref TEXT,
+            allow_insecure_http INTEGER NOT NULL CHECK (allow_insecure_http IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE TABLE model_configs (
+            id TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL REFERENCES provider_configs(id) ON DELETE CASCADE,
+            model_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('discovered', 'manual')),
+            capabilities_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (provider_id, model_id)
+          );
           CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL,
+            selected_model_config_id TEXT REFERENCES model_configs(id) ON DELETE SET NULL,
             extra_json TEXT NOT NULL DEFAULT '{}'
           );
           CREATE TABLE messages (
@@ -312,6 +610,11 @@ export class SqliteApplicationRepository implements ApplicationRepository {
             status TEXT NOT NULL CHECK (status = 'completed'),
             started_at TEXT NOT NULL,
             completed_at TEXT NOT NULL,
+            provider_id TEXT,
+            provider_name TEXT,
+            model_config_id TEXT,
+            model_id TEXT,
+            model_name TEXT,
             FOREIGN KEY (session_id, user_message_id) REFERENCES messages(session_id, id),
             FOREIGN KEY (session_id, assistant_message_id) REFERENCES messages(session_id, id)
           );
@@ -336,10 +639,10 @@ export class SqliteApplicationRepository implements ApplicationRepository {
 
   private importStore(database: Database.Database, store: StoreDocument, originalJson: Buffer, legacyVersion: number): void {
     const insertSession = database.prepare(
-      "INSERT INTO sessions (id, created_at, extra_json) VALUES (?, ?, ?)",
+      "INSERT INTO sessions (id, created_at, selected_model_config_id, extra_json) VALUES (?, ?, ?, ?)",
     );
     for (const session of store.sessions) {
-      insertSession.run(session.id, session.createdAt, stringifyExtra(session, ["id", "createdAt"]));
+      insertSession.run(session.id, session.createdAt, null, stringifyExtra(session, ["id", "createdAt", "selectedModelConfigId"]));
     }
     const insertMessage = database.prepare(`
       INSERT INTO messages (id, session_id, sequence, role, content_text, created_at, reasoning_json, extra_json)
@@ -413,6 +716,51 @@ function sessionFromRow(row: SessionRow): Session {
     id: row.id,
     createdAt: row.created_at,
   };
+}
+
+function providerConfigurationFromRow(row: ProviderConfigurationRow): ProviderConfiguration {
+  return {
+    id: row.id,
+    name: row.name,
+    protocol: row.protocol,
+    baseUrl: row.base_url,
+    allowInsecureHttp: row.allow_insecure_http === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.credential_ref === null ? {} : { credentialRef: row.credential_ref }),
+  };
+}
+
+function modelConfigurationFromRow(row: ModelConfigurationRow): ModelConfiguration {
+  let capabilities: unknown;
+  try {
+    capabilities = JSON.parse(row.capabilities_json) as unknown;
+  } catch (error) {
+    throw new StorageError("A stored model capability record is invalid JSON.", { cause: error });
+  }
+  if (
+    typeof capabilities !== "object" || capabilities === null ||
+    !isModelCapabilityStatus((capabilities as Record<string, unknown>).streaming) ||
+    !isModelCapabilityStatus((capabilities as Record<string, unknown>).toolCalling) ||
+    !isModelCapabilityStatus((capabilities as Record<string, unknown>).reasoning) ||
+    (row.source !== "discovered" && row.source !== "manual")
+  ) {
+    throw new StorageError("A stored model capability record has an unsupported format.");
+  }
+  return {
+    id: row.id,
+    providerId: row.provider_id,
+    modelId: row.model_id,
+    displayName: row.display_name,
+    source: row.source,
+    capabilities: capabilities as ModelConfiguration["capabilities"],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function isModelCapabilityStatus(value: unknown): value is ModelConfiguration["capabilities"]["streaming"] {
+  return value === "unknown" || value === "supported" || value === "unsupported";
 }
 
 function messageFromRow(row: MessageRow): Message {

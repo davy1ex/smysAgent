@@ -4,7 +4,7 @@
 
 ## Состояние
 
-Реализованы CLI и локальный React Web-клиент поверх одного Application API. Web host предоставляет список сессий, историю, создание сессии и выполнение хода через Fake или LM Studio; Web показывает текст по мере генерации и позволяет остановить запрос. Web SSE передаёт runtime/lifecycle events. SQLite-хранилище сохраняет сообщения и completed AgentRun traces; Web восстанавливает reasoning и tool steps после повторного открытия сессии. Активный run и его события после reload не восстанавливаются; projects пока не реализованы. CLI по умолчанию работает без инструментов; безопасный `demo.add` подключается и разрешается отдельными флагами.
+Реализованы CLI и локальный React Web-клиент поверх одного Application API. Web host управляет OpenAI-compatible providers/models, выбором модели для сессии и ходами через общий provider adapter или legacy env fallback. Текст, reasoning, tools и cancellation проходят через единый Runtime; SQLite хранит сообщения, completed AgentRun traces и snapshot фактически выбранной модели. Конфигурация доступна после повторного открытия приложения. Активный run и его события после reload не восстанавливаются; projects пока не реализованы. CLI по умолчанию работает без инструментов; безопасный `demo.add` подключается и разрешается отдельными флагами.
 
 ## Документация
 
@@ -48,7 +48,7 @@ npm run web:host
 npm run --prefix src/apps/web dev
 ```
 
-Откройте адрес, напечатанный Vite. Fake provider используется по умолчанию. Для LM Studio запустите host с `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<MODEL_ID>`. `SMYS_DATA_DIR` меняет каталог JSON-хранилища; пока Web host работает, CLI не должен параллельно записывать в тот же каталог.
+Откройте адрес, напечатанный Vite. Fake provider используется по умолчанию. Добавьте LM Studio, Ollama или другой OpenAI-compatible endpoint через кнопку «Настроить провайдеры и модели» в composer; host перезапускать не нужно. Для старого сценария остаются `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<MODEL_ID>`. `SMYS_DATA_DIR` задаёт общий каталог SQLite-конфигурации и истории для Web и CLI. В текущем срезе API keys хранятся в macOS Keychain; на других платформах доступны endpoints без ключа.
 
 Проверка типов и production-сборка:
 
@@ -76,6 +76,12 @@ npm run --silent cli -- history get --json --session-id <SESSION_ID>
 # Выполнить один детерминированный ход через fake provider.
 npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_ID> --text "Ответь на это сообщение"
 
+# Использовать глобальную или session-модель из общего SQLite config.
+npm run --silent cli -- agent run --json --session-id <SESSION_ID> --text "Ответь на это сообщение"
+
+# Одноразово переопределить модель для этого запуска.
+npm run --silent cli -- agent run --json --model-config-id <MODEL_CONFIG_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
+
 # Выполнить один текстовый запрос через LM Studio.
 npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Ответь на это сообщение"
 
@@ -86,7 +92,7 @@ npm run --silent cli -- agent run --json --provider fake --session-id <SESSION_I
 npm run --silent cli -- agent run --json --provider lm-studio --model <MODEL_ID> --session-id <SESSION_ID> --text "Use demo.add with a=2 and b=3, then report the result." --tool demo.add --allow-tool demo.add
 ```
 
-`agent run` требует явный `--provider fake` или `--provider lm-studio`; `--model` обязателен для LM Studio. Fake не обращается к сети. Без `--tool` CLI не передаёт инструменты. `--tool demo.add` подключает единственный встроенный инструмент, а `--allow-tool demo.add` отдельно разрешает его исполнение. Fake smoke детерминированно вызывает `demo.add(2, 3)`. Настройка endpoint и токена, формы JSON и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
+Если в общем store выбрана session/global модель, `agent run` использует её без provider-флагов; иначе продолжают работать явный `--provider` и прежний `SMYS_PROVIDER`. `--model-config-id` действует для одного запуска. Без `--tool` CLI не передаёт инструменты. `--tool demo.add` подключает единственный встроенный инструмент, а `--allow-tool demo.add` отдельно разрешает его исполнение. Настройка, JSON формы и коды завершения описаны в [CONTRACTS.md](docs/CONTRACTS.md).
 
 Инструмент доступен в CLI только при явной передаче обоих флагов `--tool demo.add` и `--allow-tool demo.add`.
 

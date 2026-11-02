@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LmStudioProvider } from "../../packages/providers/lm-studio-provider";
+import { OpenAICompatibleProviderFactory } from "../../packages/providers/lm-studio-provider";
 import { SqliteApplicationRepository } from "../../packages/storage";
 import { createWebApiServer } from "../../apps/web-host/server";
 import { FakeProvider } from "../../packages/providers/fake-provider";
@@ -65,6 +66,112 @@ test("local Web API creates sessions, runs a fake turn, and returns persisted hi
     await close(server);
     await repository.close();
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("provider configuration stays on the host, selects a model per session, and snapshots each completed run", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-web-provider-config-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const repository = new SqliteApplicationRepository(dataDir);
+  const secret = `runtime-key-${crypto.randomUUID()}`;
+  const credentials = new Map<string, string>();
+  const credentialStore = {
+    async save(reference: string, value: string) { credentials.set(reference, value); },
+    async get(reference: string) { return credentials.get(reference) ?? null; },
+    async delete(reference: string) { credentials.delete(reference); },
+  };
+  const requests: Array<{ url: string; authorization: string | null; model?: string }> = [];
+  const providerFactory = new OpenAICompatibleProviderFactory(async (input, init) => {
+    const url = String(input);
+    const authorization = new Headers(init?.headers).get("authorization");
+    const requestBody = typeof init?.body === "string" ? JSON.parse(init.body) as { model?: string } : {};
+    requests.push({ url, authorization, ...(requestBody.model === undefined ? {} : { model: requestBody.model }) });
+    if (url.endsWith("/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "chat-a" }, { id: "chat-b" }] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: `response from ${requestBody.model}` } }] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  });
+  const server = createWebApiServer({
+    repository,
+    provider: new FakeProvider(),
+    providerFactory,
+    credentialStore,
+  });
+
+  try {
+    const baseUrl = await listen(server);
+    const savedResponse = await fetch(`${baseUrl}/api/providers`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Loopback endpoint", baseUrl: "http://127.0.0.1:9000/v1", apiKey: secret }),
+    });
+    assert.equal(savedResponse.status, 201);
+    const saved = await savedResponse.json() as { provider: { id: string } };
+    const providerId = saved.provider.id;
+    assert.equal(JSON.stringify(saved).includes(secret), false);
+    assert.equal(JSON.stringify(saved).includes("credentialRef"), false);
+
+    const catalogResponse = await fetch(`${baseUrl}/api/provider-config`);
+    const catalog = await catalogResponse.json() as { models: Array<{ id: string; modelId: string; capabilities: Record<string, string> }> };
+    assert.equal(JSON.stringify(catalog).includes(secret), false);
+
+    const tested = await fetch(`${baseUrl}/api/providers/${providerId}/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ baseUrl: "http://attacker.invalid", apiKey: "ignored" }),
+    });
+    assert.equal(tested.status, 200);
+    assert.equal((await tested.json() as { status: string }).status, "connected");
+    assert.equal(requests.at(-1)?.url, "http://127.0.0.1:9000/v1/models");
+    assert.equal(requests.at(-1)?.authorization, `Bearer ${secret}`);
+
+    const discoveredResponse = await fetch(`${baseUrl}/api/providers/${providerId}/models/discover`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    const discovered = await discoveredResponse.json() as { models: Array<{ id: string; modelId: string; capabilities: Record<string, string> }> };
+    assert.equal(discoveredResponse.status, 200);
+    assert.deepEqual(discovered.models.map((model) => model.modelId), ["chat-a", "chat-b"]);
+    assert.deepEqual(discovered.models[0]?.capabilities, { streaming: "unknown", toolCalling: "unknown", reasoning: "unknown" });
+
+    const created = await fetch(`${baseUrl}/api/sessions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    }).then((response) => response.json()) as { session: { id: string } };
+    const sessionId = created.session.id;
+    for (const [index, model] of discovered.models.entries()) {
+      const selected = await fetch(`${baseUrl}/api/sessions/${sessionId}/model`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ modelConfigId: model.id }),
+      });
+      assert.equal(selected.status, 200);
+      const turn = await fetch(`${baseUrl}/api/sessions/${sessionId}/messages`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: `use model ${index}` }),
+      });
+      assert.equal(turn.status, 200);
+      assert.equal(requests.at(-1)?.model, model.modelId);
+    }
+    const [history, sessionList] = await Promise.all([
+      fetch(`${baseUrl}/api/sessions/${sessionId}/history`).then((response) => response.json()) as Promise<{
+      runs: Array<{ modelSelection?: { providerId: string; modelId: string; modelName: string } }>;
+      }>,
+      fetch(`${baseUrl}/api/sessions`).then((response) => response.json()) as Promise<{
+        sessions: Array<{ id: string; selectedModelConfigId?: string }>;
+      }>,
+    ]);
+    assert.equal(history.runs[0]?.modelSelection?.providerId, providerId);
+    assert.equal(history.runs[0]?.modelSelection?.modelId, "chat-a");
+    assert.equal(history.runs[1]?.modelSelection?.modelId, "chat-b");
+    assert.equal(history.runs[1]?.modelSelection?.modelName, "chat-b");
+    assert.equal(sessionList.sessions.find((session) => session.id === sessionId)?.selectedModelConfigId, discovered.models[1]?.id);
+
+    const crossOrigin = await fetch(`${baseUrl}/api/provider-config`, { headers: { origin: "http://evil.test" } });
+    assert.equal(crossOrigin.status, 403);
+    assert.equal((await crossOrigin.json() as { error: { code: string } }).error.code, "ORIGIN_FORBIDDEN");
+  } finally {
+    await close(server);
+    await repository.close();
   }
 });
 

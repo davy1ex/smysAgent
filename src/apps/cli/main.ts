@@ -3,6 +3,7 @@ import { AgentRuntimeError, type ToolPermissionPolicy } from "../../packages/cor
 import {
   createDemoAddTool,
   createSession,
+  resolveModelForRun,
   executeTurn,
   getHistory,
   InvalidArgumentError,
@@ -10,10 +11,15 @@ import {
   SessionNotFoundError,
   type AgentEvent,
   type ApplicationRepository,
+  type CredentialStore,
+  type ModelSelectionSnapshot,
+  type TextGenerationProvider,
+  type ProviderConfigurationRepository,
 } from "../../packages/application";
 import { SqliteApplicationRepository, StorageError } from "../../packages/storage";
 import { FakeProvider } from "../../packages/providers/fake-provider";
-import { LmStudioProvider, LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
+import { LmStudioProvider, OpenAICompatibleProviderError, OpenAICompatibleProviderFactory } from "../../packages/providers/lm-studio-provider";
+import { CredentialVaultError, MacOSCredentialStore } from "../../packages/providers/macos-credential-store";
 
 const DEFAULT_LM_STUDIO_ENDPOINT = "http://localhost:1234/v1/chat/completions";
 const FAKE_DEMO_ADD_RESPONSES = [
@@ -50,7 +56,14 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
     const abortOnInterrupt = () => controller?.abort();
     if (controller !== undefined) process.once("SIGINT", abortOnInterrupt);
     try {
-      const result = await execute(parsed, repository, env, controller?.signal);
+      const result = await execute(
+        parsed,
+        repository,
+        env,
+        new MacOSCredentialStore(),
+        new OpenAICompatibleProviderFactory(),
+        controller?.signal,
+      );
       if (!parsed.stream) writeSuccess(result, parsed.json);
       else if (parsed.output === "text") process.stdout.write("\n");
       return 0;
@@ -87,7 +100,7 @@ function parseCommand(argv: string[]): ParsedCommand {
       : command === "message-send"
         ? ["data-dir", "session-id", "text"]
         : command === "agent-run"
-          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint", "tool", "allow-tool", "stream", "output"]
+          ? ["data-dir", "session-id", "text", "provider", "model", "endpoint", "model-config-id", "tool", "allow-tool", "stream", "output"]
           : ["data-dir", "session-id"],
   );
   const options = new Map<string, string>();
@@ -145,8 +158,14 @@ function parseCommand(argv: string[]): ParsedCommand {
   if ((command === "message-send" || command === "agent-run") && !options.has("text")) {
     throw new InvalidArgumentError("--text is required.");
   }
-  if (command === "agent-run" && options.get("provider") !== "fake" && options.get("provider") !== "lm-studio") {
-    throw new InvalidArgumentError("agent run requires --provider fake or lm-studio.");
+  if (command === "agent-run" && options.has("provider") && options.get("provider") !== "fake" && options.get("provider") !== "lm-studio") {
+    throw new InvalidArgumentError("--provider supports fake or lm-studio.");
+  }
+  if (command === "agent-run" && options.has("model-config-id") && (options.has("provider") || options.has("model") || options.has("endpoint"))) {
+    throw new InvalidArgumentError("--model-config-id cannot be combined with --provider, --model, or --endpoint.");
+  }
+  if (command === "agent-run" && options.has("model-config-id") && options.get("model-config-id") === "") {
+    throw new InvalidArgumentError("--model-config-id must not be empty.");
   }
   if (command === "agent-run" && options.get("provider") === "lm-studio") {
     if (!options.has("model")) {
@@ -188,8 +207,10 @@ function parseCommand(argv: string[]): ParsedCommand {
 
 async function execute(
   parsed: ParsedCommand,
-  repository: ApplicationRepository,
+  repository: ApplicationRepository & ProviderConfigurationRepository,
   env: NodeJS.ProcessEnv,
+  credentialStore: CredentialStore,
+  providerFactory: OpenAICompatibleProviderFactory,
   signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   switch (parsed.command) {
@@ -215,17 +236,36 @@ async function execute(
       return { ok: true, sessionId, messages: history.messages };
     }
     case "agent-run": {
-      const providerName = requiredOption(parsed.options, "provider");
+      const sessionId = requiredOption(parsed.options, "session-id");
+      const requestedModelConfigId = parsed.options.get("model-config-id");
+      const explicitProviderName = parsed.options.get("provider");
       const demoAddEnabled = parsed.options.get("tool") === "demo.add";
-      const provider = providerName === "fake"
-        ? new FakeProvider(demoAddEnabled ? FAKE_DEMO_ADD_RESPONSES : [])
-        : new LmStudioProvider({
-          endpoint: resolveLmStudioEndpoint(parsed.options.get("endpoint"), env),
-          model: requiredOption(parsed.options, "model"),
-          ...(env.LM_API_TOKEN !== undefined && env.LM_API_TOKEN.trim().length > 0
-            ? { apiToken: env.LM_API_TOKEN.trim() }
-            : {}),
-        });
+      let provider: TextGenerationProvider;
+      let modelSelection: ModelSelectionSnapshot | undefined;
+      if (requestedModelConfigId !== undefined) {
+        const resolved = await resolveModelForRun(repository, credentialStore, providerFactory, { sessionId, requestedModelConfigId });
+        if (resolved === null) throw new InvalidArgumentError("--model-config-id could not be resolved.");
+        provider = resolved.provider;
+        modelSelection = resolved.snapshot;
+      } else if (explicitProviderName !== undefined) {
+        const legacy = createLegacyCliProvider(explicitProviderName, parsed.options, env, demoAddEnabled);
+        provider = legacy.provider;
+        modelSelection = legacy.modelSelection;
+      } else {
+        const configured = await resolveModelForRun(repository, credentialStore, providerFactory, { sessionId });
+        if (configured !== null) {
+          provider = configured.provider;
+          modelSelection = configured.snapshot;
+        } else {
+          const legacyName = env.SMYS_PROVIDER;
+          if (legacyName !== "fake" && legacyName !== "lm-studio") {
+            throw new InvalidArgumentError("No model is selected. Configure a model, set SMYS_PROVIDER, or pass --provider.");
+          }
+          const legacy = createLegacyCliProvider(legacyName, parsed.options, env, demoAddEnabled);
+          provider = legacy.provider;
+          modelSelection = legacy.modelSelection;
+        }
+      }
       const agentOptions = demoAddEnabled
         ? {
           tools: [createDemoAddTool()],
@@ -250,14 +290,52 @@ async function execute(
         repository,
         provider,
         {
-          sessionId: requiredOption(parsed.options, "session-id"),
+          sessionId,
           text: requiredOption(parsed.options, "text"),
+          ...(modelSelection === undefined ? {} : { modelSelection }),
         },
         { ...agentOptions, ...streamOptions, ...(signal === undefined ? {} : { signal }) },
       );
       return { ok: true, ...turn };
     }
   }
+}
+
+function createLegacyCliProvider(
+  providerName: string,
+  options: Map<string, string>,
+  env: NodeJS.ProcessEnv,
+  demoAddEnabled: boolean,
+): { provider: TextGenerationProvider; modelSelection: ModelSelectionSnapshot } {
+  if (providerName === "fake") {
+    return {
+      provider: new FakeProvider(demoAddEnabled ? FAKE_DEMO_ADD_RESPONSES : []),
+      modelSelection: {
+        providerId: "legacy:fake",
+        providerName: "Fake",
+        modelConfigId: "legacy:fake",
+        modelId: "fake",
+        modelName: "Fake",
+      },
+    };
+  }
+  const model = options.get("model") ?? env.LM_STUDIO_MODEL?.trim();
+  if (model === undefined || model.length === 0) throw new InvalidArgumentError("LM_STUDIO_MODEL or --model is required for LM Studio.");
+  const apiToken = env.LM_API_TOKEN?.trim();
+  return {
+    provider: new LmStudioProvider({
+      endpoint: resolveLmStudioEndpoint(options.get("endpoint"), env),
+      model,
+      ...(apiToken === undefined || apiToken.length === 0 ? {} : { apiToken }),
+    }),
+    modelSelection: {
+      providerId: "legacy:lm-studio",
+      providerName: "LM Studio (env/CLI)",
+      modelConfigId: `legacy:lm-studio:${model}`,
+      modelId: model,
+      modelName: model,
+    },
+  };
 }
 
 function createCliPermissionPolicy(options: Map<string, string>): ToolPermissionPolicy {
@@ -328,7 +406,7 @@ function toCliError(error: unknown): CliErrorPayload {
   if (error instanceof StorageError) {
     return { code: "STORAGE_ERROR", message: error.message };
   }
-  if (error instanceof LmStudioProviderError) {
+  if (error instanceof OpenAICompatibleProviderError || error instanceof CredentialVaultError) {
     return { code: "INTERNAL_ERROR", message: error.message };
   }
   if (error instanceof AgentRuntimeError) {

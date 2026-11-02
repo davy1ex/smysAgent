@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { SqliteApplicationRepository } from "../../packages/storage";
+import { randomUUID } from "node:crypto";
 
 const cliPath = resolve(__dirname, "../../apps/cli/main.js");
 
@@ -395,6 +396,62 @@ test("LM Studio CLI turns persist and a separate history process reads them", as
     ["user", 3, "second LM Studio request"],
     ["assistant", 4, "stubbed model reply"],
   ]);
+});
+
+test("CLI resolves an explicit or default model from the same persisted configuration as Web", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-cli-model-config-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const stub = await startLmStudioStub(200, { choices: [{ message: { content: "configured response" } }] });
+  t.after(async () => stub.close());
+  const repository = new SqliteApplicationRepository(dataDir);
+  const sessionId = `session-${randomUUID()}`;
+  const providerId = `provider-${randomUUID()}`;
+  const modelConfigId = `model-${randomUUID()}`;
+  const now = new Date().toISOString();
+  await repository.saveProviderConfiguration({
+    id: providerId,
+    name: "CLI shared endpoint",
+    protocol: "openai-chat-completions",
+    baseUrl: stub.endpoint.replace(/\/chat\/completions$/, ""),
+    allowInsecureHttp: false,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await repository.saveModelConfiguration({
+    id: modelConfigId,
+    providerId,
+    modelId: "configured-model",
+    displayName: "Configured model",
+    source: "manual",
+    capabilities: { streaming: "unknown", toolCalling: "unknown", reasoning: "unknown" },
+    createdAt: now,
+    updatedAt: now,
+  });
+  await repository.setDefaultModelConfigId(modelConfigId);
+  await repository.createSession({ id: sessionId, createdAt: now });
+  await repository.close();
+
+  const explicitRun = await runCliAsync(dataDir, [
+    "agent", "run", "--json", "--model-config-id", modelConfigId,
+    "--session-id", sessionId, "--text", "explicit configured model",
+  ], { SMYS_PROVIDER: "fake" });
+  assert.equal(explicitRun.status, 0, explicitRun.stderr);
+  const defaultRun = await runCliAsync(dataDir, [
+    "agent", "run", "--json", "--session-id", sessionId, "--text", "global default model",
+  ], { SMYS_PROVIDER: "fake" });
+  assert.equal(defaultRun.status, 0, defaultRun.stderr);
+  assert.deepEqual(stub.requests.map((request) => (request.body as { model?: string }).model), [
+    "configured-model", "configured-model",
+  ]);
+
+  const reopened = new SqliteApplicationRepository(dataDir);
+  try {
+    const runs = await reopened.listCompletedRuns(sessionId);
+    assert.deepEqual(runs.map((run) => run.modelSelection?.modelConfigId), [modelConfigId, modelConfigId]);
+    assert.deepEqual(runs.map((run) => run.modelSelection?.modelId), ["configured-model", "configured-model"]);
+  } finally {
+    await reopened.close();
+  }
 });
 
 test("LM Studio HTTP failure uses the CLI error contract and leaves the user message in history", async (t) => {

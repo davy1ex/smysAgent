@@ -3,11 +3,44 @@ export interface SessionSummary {
   createdAt: string;
   updatedAt: string;
   title: string;
+  selectedModelConfigId?: string;
 }
 
 export interface SessionRecord {
   id: string;
   createdAt: string;
+  selectedModelConfigId?: string;
+}
+
+export type ModelCapabilityStatus = "unknown" | "supported" | "unsupported";
+
+export interface ModelConfiguration {
+  id: string;
+  providerId: string;
+  modelId: string;
+  displayName: string;
+  source: "discovered" | "manual";
+  capabilities: { streaming: ModelCapabilityStatus; toolCalling: ModelCapabilityStatus; reasoning: ModelCapabilityStatus };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProviderConfiguration {
+  id: string;
+  name: string;
+  protocol: "openai-chat-completions";
+  baseUrl: string;
+  allowInsecureHttp: boolean;
+  hasCredential: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProviderCatalog {
+  providers: ProviderConfiguration[];
+  models: ModelConfiguration[];
+  defaultModelConfigId: string | null;
+  credentialVaultAvailable: boolean;
 }
 
 export interface SessionMessage {
@@ -34,6 +67,7 @@ export interface CompletedAgentRun {
   startedAt: string;
   completedAt: string;
   steps: AgentRunStep[];
+  modelSelection?: { providerId: string; providerName: string; modelConfigId: string; modelId: string; modelName: string };
 }
 
 export interface SessionHistory {
@@ -72,6 +106,75 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
   return result.sessions;
 }
 
+export async function fetchProviderCatalog(): Promise<ProviderCatalog> {
+  const result = await request<ProviderCatalog & { ok: true }>("/api/provider-config");
+  return {
+    providers: result.providers,
+    models: result.models,
+    defaultModelConfigId: result.defaultModelConfigId,
+    credentialVaultAvailable: result.credentialVaultAvailable,
+  };
+}
+
+export async function saveProvider(input: {
+  id?: string;
+  name: string;
+  baseUrl: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  allowInsecureHttp?: boolean;
+}): Promise<ProviderConfiguration> {
+  const { id, ...body } = input;
+  const path = id === undefined ? "/api/providers" : `/api/providers/${encodeURIComponent(id)}`;
+  const result = await request<{ provider: ProviderConfiguration }>(path, {
+    method: id === undefined ? "POST" : "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return result.provider;
+}
+
+export async function deleteProvider(providerId: string): Promise<void> {
+  await request(`/api/providers/${encodeURIComponent(providerId)}`, { method: "DELETE" });
+}
+
+export async function testProvider(providerId: string): Promise<"connected" | "discovery-unavailable"> {
+  const result = await request<{ status: "connected" | "discovery-unavailable" }>(`/api/providers/${encodeURIComponent(providerId)}/test`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  return result.status;
+}
+
+export async function discoverProviderModels(providerId: string): Promise<ModelConfiguration[]> {
+  const result = await request<{ models: ModelConfiguration[] }>(`/api/providers/${encodeURIComponent(providerId)}/models/discover`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  return result.models;
+}
+
+export async function addManualModel(input: { providerId: string; modelId: string; displayName?: string }): Promise<ModelConfiguration> {
+  const result = await request<{ model: ModelConfiguration }>("/api/models", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+  });
+  return result.model;
+}
+
+export async function deleteModel(modelConfigId: string): Promise<void> {
+  await request(`/api/models/${encodeURIComponent(modelConfigId)}`, { method: "DELETE" });
+}
+
+export async function setDefaultModel(modelConfigId: string | null): Promise<void> {
+  await request("/api/settings/default-model", {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ modelConfigId }),
+  });
+}
+
+export async function setSessionModel(sessionId: string, modelConfigId: string | null): Promise<void> {
+  await request(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+    method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ modelConfigId }),
+  });
+}
+
 export async function createSession(): Promise<SessionRecord> {
   const result = await request<{ session: SessionRecord }>("/api/sessions", {
     method: "POST",
@@ -104,13 +207,14 @@ export async function sendMessageStream(
   handlers: AgentTurnStreamHandlers,
   signal?: AbortSignal,
   allowTools: readonly string[] = [],
+  modelConfigId?: string,
 ): Promise<AgentTurn> {
   let response: Response;
   try {
     response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages/stream`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "text/event-stream" },
-      body: JSON.stringify({ text, ...(allowTools.length === 0 ? {} : { allowTools }) }),
+      body: JSON.stringify({ text, ...(allowTools.length === 0 ? {} : { allowTools }), ...(modelConfigId === undefined ? {} : { modelConfigId }) }),
       ...(signal === undefined ? {} : { signal }),
     });
   } catch {

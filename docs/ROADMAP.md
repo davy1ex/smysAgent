@@ -15,8 +15,8 @@
 
 | Этап | Утверждённое направление | Статус реализации на 2026-11-02 |
 | --- | --- | --- |
-| **M1. Unified Agent Execution** | Один Core algorithm и Application lifecycle для CLI/Web; tools, permissions, streaming, reasoning/events и cancellation в общей модели исполнения. | `Accepted` · `Implemented`. ADR-0012—0014 приняты; Core/Application/CLI/Web host используют общий путь, live reasoning ранее подтверждён на LM Studio. Текущая проверка: 76 root + 3 Web tests прошли; build/typecheck/lint прошли. См. [spec 001](./specs/001-unified-agent-execution.md) и [spec 002](./specs/002-live-inference-ui.md). |
-| **M2. Persistent Runs + SQLite** | Сохранённые completed runs, статусы, события/tool calls и восстановление траектории; безопасная координация записей. | Направление `Accepted`; completed run traces, SQLite v1, JSON v1/v2/v3 import и Web restoration `Implemented` по ADR-0016. Active inference recovery, event replay и inference resource locks остаются `Planned`. |
+| **M1. Unified Agent Execution** | Один Core algorithm и Application lifecycle для CLI/Web; tools, permissions, streaming, reasoning/events и cancellation в общей модели исполнения. | `Accepted` · `Implemented`. ADR-0012—0014 приняты; Core/Application/CLI/Web host используют общий путь, live reasoning подтверждён на LM Studio. Текущая регрессионная проверка: 85 root + 3 Web tests, build/typecheck/lint и Web production build прошли. См. [spec 001](./specs/001-unified-agent-execution.md) и [spec 002](./specs/002-live-inference-ui.md). |
+| **M2. Persistent Runs + SQLite** | Сохранённые completed runs, статусы, события/tool calls и восстановление траектории; безопасная координация записей. | Направление `Accepted`; completed run traces, SQLite v2, JSON v1/v2/v3 import и Web restoration `Implemented` по ADR-0016/0017. Active inference recovery, event replay и inference resource locks остаются `Planned`. |
 | **M3. Agent Profiles + System Prompts + Skills** | Управляемые профили, system prompts, разрешённые инструменты и статическая загрузка skills. | `Accepted` · `Planned`; реализации в текущем кодовом дереве не найдено. |
 | **M4. Web Search + Fetch** | Проверяемые инструменты поиска и чтения внешних источников. | `Accepted` · `Planned`; реализации в текущем кодовом дереве не найдено. |
 | **M5. Research Workflow** | Многоэтапное исследование с проверкой источников, evidence, бюджетами и условиями остановки. | `Accepted` · `Planned`; реализации в текущем кодовом дереве не найдено. |
@@ -25,6 +25,10 @@
 ## Live-inference UX
 
 Требования владельца собраны в [`specs/002-live-inference-ui.md`](./specs/002-live-inference-ui.md). Текстовый streaming, per-call progressive reasoning (`reasoning.delta`), безопасный Markdown и backend persistence completed reasoning реализованы; live streaming проверен на LM Studio/Fake Provider. Восстановление active run и координация inference остаются отдельными задачами.
+
+## Provider & Model Configuration
+
+Срез `Accepted` и `Implemented` по [ADR-0017](./DECISIONS/ADR-0017-provider-model-configuration.md) и [spec 003](./specs/003-provider-model-configuration.md): один Application resolver обслуживает CLI и Web; пользователь управляет OpenAI-compatible providers/models через Web, обнаруживает или вводит Model ID вручную, сохраняет session/global selections и начинает следующий ход без перезапуска host. SQLite schema v1 транзакционно мигрирует в v2. Completed runs хранят фактические provider/model snapshots; discovery не утверждает capabilities. Автоматические тесты покрывают общий SQLite источник для CLI/Web, credential masking, migration, precedence и смену модели между ходами. Ручная проверка с живым LM Studio отражается отдельно в `NOW.md`.
 
 ## Сквозные ограничения
 

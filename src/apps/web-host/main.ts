@@ -1,7 +1,8 @@
 import { resolve } from "node:path";
-import { createDemoAddTool, type TextGenerationProvider } from "../../packages/application";
+import { createDemoAddTool, type ModelSelectionSnapshot, type TextGenerationProvider } from "../../packages/application";
 import { FakeProvider } from "../../packages/providers/fake-provider";
-import { LmStudioProvider } from "../../packages/providers/lm-studio-provider";
+import { LmStudioProvider, OpenAICompatibleProviderFactory } from "../../packages/providers/lm-studio-provider";
+import { MacOSCredentialStore } from "../../packages/providers/macos-credential-store";
 import { SqliteApplicationRepository } from "../../packages/storage";
 import { createWebApiServer } from "./server";
 
@@ -12,7 +13,15 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   const port = resolvePort(env.SMYS_WEB_PORT);
   const dataDir = resolve(process.cwd(), env.SMYS_DATA_DIR || ".smys-agent");
   const repository = new SqliteApplicationRepository(dataDir);
-  const server = createWebApiServer({ repository, provider: resolveProvider(env), tools: [createDemoAddTool()] });
+  const legacy = resolveProvider(env);
+  const server = createWebApiServer({
+    repository,
+    provider: legacy.provider,
+    fallbackModelSelection: legacy.modelSelection,
+    providerFactory: new OpenAICompatibleProviderFactory(),
+    credentialStore: new MacOSCredentialStore(),
+    tools: [createDemoAddTool()],
+  });
 
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
@@ -38,10 +47,19 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   });
 }
 
-function resolveProvider(env: NodeJS.ProcessEnv): TextGenerationProvider {
+function resolveProvider(env: NodeJS.ProcessEnv): { provider: TextGenerationProvider; modelSelection: ModelSelectionSnapshot } {
   const providerName = env.SMYS_PROVIDER ?? "fake";
   if (providerName === "fake") {
-    return new FakeProvider();
+    return {
+      provider: new FakeProvider(),
+      modelSelection: {
+        providerId: "legacy:fake",
+        providerName: "Fake",
+        modelConfigId: "legacy:fake",
+        modelId: "fake",
+        modelName: "Fake",
+      },
+    };
   }
   if (providerName !== "lm-studio") {
     throw new Error("SMYS_PROVIDER must be fake or lm-studio.");
@@ -63,11 +81,20 @@ function resolveProvider(env: NodeJS.ProcessEnv): TextGenerationProvider {
   }
 
   const apiToken = env.LM_API_TOKEN?.trim();
-  return new LmStudioProvider({
-    endpoint,
-    model,
-    ...(apiToken === undefined || apiToken.length === 0 ? {} : { apiToken }),
-  });
+  return {
+    provider: new LmStudioProvider({
+      endpoint,
+      model,
+      ...(apiToken === undefined || apiToken.length === 0 ? {} : { apiToken }),
+    }),
+    modelSelection: {
+      providerId: "legacy:lm-studio",
+      providerName: "LM Studio (env)",
+      modelConfigId: `legacy:lm-studio:${model}`,
+      modelId: model,
+      modelName: model,
+    },
+  };
 }
 
 function resolvePort(value: string | undefined): number {

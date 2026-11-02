@@ -106,6 +106,7 @@ button:disabled { opacity: 1; cursor: default; }
 .message-meta { display: flex; min-height: 14px; align-items: center; gap: 7px; color: #8b8d8f; font-size: 9px; }
 .message-meta strong { color: #c6c8c4; font-size: 10px; font-weight: 550; }
 .message-meta time { margin-left: auto; color: #626466; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.message-model-label { overflow: hidden; color: #8b9485; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .message-content p { margin: 6px 0 0; color: #d2d3d0; font-size: 11px; line-height: 1.65; }
 .message-content p.streaming-placeholder { color: #8f918e; font-style: italic; }
 .streaming-cursor { margin-left: 1px; color: var(--running); animation: blink 1s steps(2, start) infinite; }
@@ -261,7 +262,10 @@ button:disabled { opacity: 1; cursor: default; }
 .composer-toolbar { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
 .composer-icon-button { display: grid; width: 25px; height: 25px; place-items: center; border: 0; border-radius: 5px; color: #858789; background: transparent; }
 .composer-controls { display: flex; align-items: center; gap: 10px; color: #77797b; font-size: 8px; }
-.composer-model { color: #a9aba7; }
+.composer-model-select, .composer-settings-button { max-width: 190px; min-height: 26px; padding: 0 7px; border: 1px solid #343638; border-radius: 5px; color: #b9bbb7; background: #1b1c1e; font-size: 8px; }
+.composer-model-select { min-width: 120px; }
+.composer-settings-button { cursor: pointer; }
+.composer-settings-button:hover { border-color: #55575a; color: #e1e2df; }
 .send-button { display: grid; width: 26px; height: 26px; place-items: center; border: 1px solid #363739; border-radius: 6px; color: #77797a; background: #252629; }
 .composer-note { margin: 6px 0 0; color: #606264; font-size: 8px; text-align: center; }
 .composer-toolbar .composer-note { margin: 0; text-align: left; }
@@ -270,6 +274,50 @@ button:disabled { opacity: 1; cursor: default; }
 .send-button:not(:disabled):hover { border-color: #55575a; background: #3a3b3e; }
 .stop-button { min-height: 27px; padding: 0 9px; border: 1px solid #4a3432; border-radius: 6px; color: #d5aaa4; background: #2a201f; font-size: 9px; cursor: pointer; }
 .stop-button:hover { border-color: #684540; background: #352725; }
+
+.settings-backdrop { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / 68%); }
+.provider-settings { display: flex; width: min(760px, 100%); max-height: min(88vh, 900px); flex-direction: column; overflow: hidden; border: 1px solid #3a3b3d; border-radius: 12px; background: #151618; box-shadow: 0 24px 80px rgb(0 0 0 / 48%); }
+.provider-settings-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 22px; border-bottom: 1px solid #292a2c; }
+.provider-settings-header h2 { margin: 5px 0 0; color: #e5e6e2; font-size: 18px; font-weight: 550; }
+.settings-eyebrow { color: #858985; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; }
+.settings-close { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid #363739; border-radius: 6px; color: #aeb0ac; background: #1d1e20; font-size: 19px; cursor: pointer; }
+.provider-settings-content { display: grid; gap: 14px; overflow: auto; padding: 16px 22px 22px; }
+.settings-section { display: grid; gap: 10px; padding: 14px; border: 1px solid #2b2c2e; border-radius: 8px; background: #191a1c; }
+.settings-section h3 { margin: 0; color: #d7d9d4; font-size: 11px; font-weight: 550; }
+.settings-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.settings-section-heading > span, .settings-note, .settings-empty { margin: 0; color: #838583; font-size: 9px; line-height: 1.5; }
+.settings-copy { margin: 0; color: #858785; font-size: 9px; line-height: 1.5; }
+.provider-form { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; }
+.provider-form > label, .settings-section > select { display: grid; gap: 5px; color: #aeb0ac; font-size: 9px; }
+.provider-form input, .settings-section select, .manual-model-form input, .manual-model-form select { width: 100%; min-width: 0; min-height: 32px; padding: 0 8px; border: 1px solid #393a3c; border-radius: 5px; outline: 0; color: #d9dad7; background: #121315; font-size: 10px; }
+.provider-form input:focus, .settings-section select:focus, .manual-model-form input:focus, .manual-model-form select:focus { border-color: #72766d; }
+.provider-form > label:nth-child(3), .settings-warning, .settings-check, .settings-form-actions { grid-column: 1 / -1; }
+.settings-check, .settings-warning { display: flex !important; grid-template-columns: auto 1fr; align-items: start; gap: 7px !important; line-height: 1.5; }
+.settings-check input, .settings-warning input { width: auto; min-height: auto; margin: 1px 0 0; accent-color: #aaa; }
+.settings-warning { color: #d2ae79 !important; }
+.settings-warning-copy { margin: 0; color: #d2ae79; font-size: 9px; }
+.settings-form-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.settings-primary, .settings-secondary, .provider-card-actions button, .manual-model-form button { min-height: 29px; padding: 0 9px; border: 1px solid #393a3c; border-radius: 5px; color: #c8cac5; background: #222326; font-size: 9px; cursor: pointer; }
+.settings-primary { border-color: #555750; color: #e2e4dd; background: #30322e; }
+.settings-primary:disabled, .settings-secondary:disabled, .provider-card-actions button:disabled { opacity: .55; }
+.settings-error { margin: 0; color: var(--error); font-size: 10px; }
+.provider-list { display: grid; gap: 9px; }
+.provider-card { display: grid; gap: 9px; padding: 11px; border: 1px solid #303133; border-radius: 7px; background: #141517; }
+.provider-card-heading { display: flex; justify-content: space-between; gap: 10px; }
+.provider-card-heading > div { display: grid; min-width: 0; gap: 3px; }
+.provider-card-heading strong { color: #d9dad6; font-size: 10px; font-weight: 550; }
+.provider-card-heading > div > span { overflow-wrap: anywhere; color: #777a7a; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.provider-auth-state { flex: 0 0 auto; color: #8a9a82; font-size: 8px; }
+.provider-card-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.provider-card-actions .settings-danger { color: #ca8981; }
+.provider-status { margin: 0; color: #aab79f; font-size: 9px; line-height: 1.45; }
+.provider-model-list { display: grid; gap: 5px; margin: 0; padding: 8px 0 0; border-top: 1px solid #28292b; list-style: none; }
+.provider-model-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.provider-model-list li > span { display: grid; min-width: 0; gap: 3px; }
+.provider-model-list strong { overflow: hidden; color: #c2c4bf; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.provider-model-list small { color: #77797a; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.provider-model-list button { width: 23px; height: 23px; border: 0; border-radius: 4px; color: #b8837d; background: #272021; cursor: pointer; }
+.manual-model-form { display: grid; grid-template-columns: 1fr 1.2fr 1.2fr auto; gap: 6px; }
 
 @keyframes rotate { to { transform: rotate(360deg); } }
 @keyframes blink { to { visibility: hidden; } }
@@ -320,7 +368,18 @@ button:disabled { opacity: 1; cursor: default; }
   .step-summary { max-width: 36vw; font-size: 8px; }
   .status-compact > span { display: none; }
   .composer-controls { gap: 7px; }
-  .composer-model { font-size: 7px; }
+  .composer-model-select { min-width: 88px; max-width: 105px; padding-inline: 4px; font-size: 7px; }
+  .composer-settings-button { padding-inline: 5px; font-size: 7px; }
+}
+
+@media (max-width: 640px) {
+  .settings-backdrop { padding: 0; }
+  .provider-settings { width: 100%; height: 100%; max-height: 100%; border-radius: 0; }
+  .provider-settings-content { padding: 12px; }
+  .provider-settings-header { padding: 14px 15px; }
+  .provider-form { grid-template-columns: 1fr; }
+  .provider-form > label:nth-child(3), .settings-warning, .settings-check, .settings-form-actions { grid-column: auto; }
+  .manual-model-form { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

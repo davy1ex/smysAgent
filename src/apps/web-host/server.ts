@@ -3,17 +3,31 @@ import { randomUUID } from "node:crypto";
 import {
   AgentRuntimeError,
   createSession,
+  deleteModelConfiguration,
+  deleteProviderConfiguration,
+  discoverConfiguredProviderModels,
   executeTurn,
+  getProviderCatalog,
   getHistory,
   getSessionTrajectory,
   InvalidArgumentError,
   listSessions,
+  resolveModelForRun,
+  saveModelConfiguration,
+  saveProviderConfiguration,
+  setDefaultModelConfiguration,
+  setSessionModelConfiguration,
   SessionNotFoundError,
+  testConfiguredProviderConnection,
   type AgentTool,
   type ApplicationRepository,
+  type CredentialStore,
+  type OpenAICompatibleProviderFactory,
+  type ProviderConfigurationRepository,
   type TextGenerationProvider,
 } from "../../packages/application";
-import { LmStudioProviderError } from "../../packages/providers/lm-studio-provider";
+import { LmStudioProviderError, OpenAICompatibleProviderError } from "../../packages/providers/lm-studio-provider";
+import { CredentialVaultError } from "../../packages/providers/macos-credential-store";
 import { StorageError } from "../../packages/storage";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -24,12 +38,22 @@ interface ApiFailure {
 }
 
 export interface WebApiDependencies {
-  repository: ApplicationRepository;
+  repository: ApplicationRepository & ProviderConfigurationRepository;
   provider: TextGenerationProvider;
+  fallbackModelSelection?: { providerId: string; providerName: string; modelConfigId: string; modelId: string; modelName: string };
+  providerFactory?: OpenAICompatibleProviderFactory;
+  credentialStore?: CredentialStore;
   tools?: readonly AgentTool[];
 }
 
-export function createWebApiServer({ repository, provider, tools = [] }: WebApiDependencies): Server {
+export function createWebApiServer({
+  repository,
+  provider,
+  fallbackModelSelection,
+  providerFactory,
+  credentialStore,
+  tools = [],
+}: WebApiDependencies): Server {
   let mutationQueue = Promise.resolve();
 
   const serializeMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -39,28 +63,117 @@ export function createWebApiServer({ repository, provider, tools = [] }: WebApiD
   };
 
   return createServer((request, response) => {
-    void handleRequest(request, response, repository, provider, tools, serializeMutation);
+    void handleRequest(request, response, repository, provider, fallbackModelSelection, providerFactory, credentialStore, tools, serializeMutation);
   });
 }
 
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  repository: ApplicationRepository,
+  repository: ApplicationRepository & ProviderConfigurationRepository,
   provider: TextGenerationProvider,
+  fallbackModelSelection: WebApiDependencies["fallbackModelSelection"],
+  providerFactory: WebApiDependencies["providerFactory"],
+  credentialStore: WebApiDependencies["credentialStore"],
   availableTools: readonly AgentTool[],
   serializeMutation: <T>(operation: () => Promise<T>) => Promise<T>,
 ): Promise<void> {
   try {
+    assertLocalRequest(request);
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/api/provider-config" && request.method === "GET") {
+      sendJson(response, 200, { ok: true, credentialVaultAvailable: process.platform === "darwin", ...(await getProviderCatalog(repository)) });
+      return;
+    }
+    if (url.pathname === "/api/providers" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      const saved = await serializeMutation(() => saveProviderConfiguration(repository, requireCredentialStore(credentialStore), parseProviderInput(body)));
+      sendJson(response, 201, { ok: true, provider: saved });
+      return;
+    }
+    const providerRoute = /^\/api\/providers\/([^/]+)$/.exec(url.pathname);
+    if (providerRoute !== null && request.method === "PUT") {
+      const providerId = decodePathSegment(providerRoute[1]);
+      const body = await readJsonBody(request);
+      const saved = await serializeMutation(() => saveProviderConfiguration(
+        repository,
+        requireCredentialStore(credentialStore),
+        { ...parseProviderInput(body), id: providerId },
+      ));
+      sendJson(response, 200, { ok: true, provider: saved });
+      return;
+    }
+    if (providerRoute !== null && request.method === "DELETE") {
+      const providerId = decodePathSegment(providerRoute[1]);
+      const deleted = await serializeMutation(() => deleteProviderConfiguration(repository, requireCredentialStore(credentialStore), providerId));
+      if (!deleted) throw new InvalidArgumentError("Provider configuration was not found.");
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    const providerTestRoute = /^\/api\/providers\/([^/]+)\/test$/.exec(url.pathname);
+    if (providerTestRoute !== null && request.method === "POST") {
+      await readJsonBody(request);
+      const status = await testConfiguredProviderConnection(
+        repository,
+        requireCredentialStore(credentialStore),
+        requireProviderFactory(providerFactory),
+        decodePathSegment(providerTestRoute[1]),
+      );
+      sendJson(response, 200, { ok: true, status });
+      return;
+    }
+    const providerModelsRoute = /^\/api\/providers\/([^/]+)\/models\/discover$/.exec(url.pathname);
+    if (providerModelsRoute !== null && request.method === "POST") {
+      await readJsonBody(request);
+      const models = await serializeMutation(() => discoverConfiguredProviderModels(
+        repository,
+        requireCredentialStore(credentialStore),
+        requireProviderFactory(providerFactory),
+        decodePathSegment(providerModelsRoute[1]),
+      ));
+      sendJson(response, 200, { ok: true, models });
+      return;
+    }
+    if (url.pathname === "/api/models" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      const model = await serializeMutation(() => saveModelConfiguration(repository, {
+        providerId: requiredString(body.providerId, "providerId"),
+        modelId: requiredString(body.modelId, "modelId"),
+        ...(typeof body.displayName === "string" ? { displayName: body.displayName } : {}),
+      }));
+      sendJson(response, 201, { ok: true, model });
+      return;
+    }
+    const modelRoute = /^\/api\/models\/([^/]+)$/.exec(url.pathname);
+    if (modelRoute !== null && request.method === "DELETE") {
+      const deleted = await serializeMutation(() => deleteModelConfiguration(repository, decodePathSegment(modelRoute[1])));
+      if (!deleted) throw new InvalidArgumentError("Model configuration was not found.");
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (url.pathname === "/api/settings/default-model" && request.method === "PUT") {
+      const body = await readJsonBody(request);
+      await serializeMutation(() => setDefaultModelConfiguration(repository, optionalNullableString(body.modelConfigId, "modelConfigId")));
+      sendJson(response, 200, { ok: true });
+      return;
+    }
     if (url.pathname === "/api/sessions" && request.method === "GET") {
-      sendJson(response, 200, { ok: true, sessions: await listSessions(repository) });
+      sendJson(response, 200, { ok: true, sessions: await listSessions(repository, repository) });
       return;
     }
     if (url.pathname === "/api/sessions" && request.method === "POST") {
       await readJsonBody(request);
       const result = await serializeMutation(async () => ({ session: await createSession(repository) }));
       sendJson(response, 201, { ok: true, ...result });
+      return;
+    }
+
+    const sessionModelRoute = /^\/api\/sessions\/([^/]+)\/model$/.exec(url.pathname);
+    if (sessionModelRoute !== null && request.method === "PATCH") {
+      const sessionId = decodePathSegment(sessionModelRoute[1]);
+      const body = await readJsonBody(request);
+      await serializeMutation(() => setSessionModelConfiguration(repository, sessionId, optionalNullableString(body.modelConfigId, "modelConfigId")));
+      sendJson(response, 200, { ok: true });
       return;
     }
 
@@ -79,6 +192,7 @@ async function handleRequest(
         throw new InvalidArgumentError("Message text must be a string.");
       }
       const allowedTools = resolveAllowedTools(body.allowTools, availableTools);
+      const modelConfigId = optionalString(body.modelConfigId, "modelConfigId");
       const runId = randomUUID();
       const abortController = new AbortController();
       const abortOnRequest = () => abortController.abort();
@@ -91,8 +205,12 @@ async function handleRequest(
         await serializeMutation(() => streamTurnResponse(
           repository,
           provider,
+          fallbackModelSelection,
+          providerFactory,
+          credentialStore,
           sessionId,
           body.text as string,
+          modelConfigId,
           allowedTools,
           runId,
           response,
@@ -113,13 +231,17 @@ async function handleRequest(
         throw new InvalidArgumentError("Message text must be a string.");
       }
       const allowedTools = resolveAllowedTools(body.allowTools, availableTools);
+      const modelConfigId = optionalString(body.modelConfigId, "modelConfigId");
       const runId = randomUUID();
       const result = await serializeMutation(async () => {
         try {
+          const resolved = await resolveModelForRunIfConfigured(
+            repository, provider, fallbackModelSelection, providerFactory, credentialStore, sessionId, modelConfigId,
+          );
           const turn = await executeTurn(
             repository,
-            provider,
-            { sessionId, text: body.text as string, runId },
+            resolved.provider,
+            { sessionId, text: body.text as string, runId, ...(resolved.modelSelection === undefined ? {} : { modelSelection: resolved.modelSelection }) },
             createWebAgentOptions(allowedTools),
           );
           return {
@@ -160,10 +282,14 @@ async function handleRequest(
 }
 
 async function streamTurnResponse(
-  repository: ApplicationRepository,
+  repository: ApplicationRepository & ProviderConfigurationRepository,
   provider: TextGenerationProvider,
+  fallbackModelSelection: WebApiDependencies["fallbackModelSelection"],
+  providerFactory: WebApiDependencies["providerFactory"],
+  credentialStore: WebApiDependencies["credentialStore"],
   sessionId: string,
   text: string,
+  modelConfigId: string | undefined,
   allowedTools: readonly AgentTool[],
   runId: string,
   response: ServerResponse,
@@ -180,10 +306,13 @@ async function streamTurnResponse(
   let turnId: string | undefined;
 
   try {
+    const resolved = await resolveModelForRunIfConfigured(
+      repository, provider, fallbackModelSelection, providerFactory, credentialStore, sessionId, modelConfigId,
+    );
     await executeTurn(
       repository,
-      provider,
-      { sessionId, text, runId },
+      resolved.provider,
+      { sessionId, text, runId, ...(resolved.modelSelection === undefined ? {} : { modelSelection: resolved.modelSelection }) },
       {
         ...createWebAgentOptions(allowedTools),
         signal,
@@ -331,7 +460,106 @@ function decodePathSegment(value: string | undefined): string {
   }
 }
 
+function assertLocalRequest(request: IncomingMessage): void {
+  const hostValue = request.headers.host;
+  if (typeof hostValue !== "string") throw new HttpSecurityError("The request Host header is required.");
+  let host: URL;
+  try {
+    host = new URL(`http://${hostValue}`);
+  } catch {
+    throw new HttpSecurityError("The request Host header is invalid.");
+  }
+  if (!isLoopbackHostname(host.hostname)) throw new HttpSecurityError("The Web API accepts loopback requests only.");
+
+  const originValue = request.headers.origin;
+  if (originValue === undefined) return;
+  let origin: URL;
+  try {
+    origin = new URL(originValue);
+  } catch {
+    throw new HttpSecurityError("The request Origin header is invalid.");
+  }
+  if (!isLoopbackHostname(origin.hostname) || origin.host.toLowerCase() !== hostValue.toLowerCase()) {
+    throw new HttpSecurityError("Cross-origin requests are not allowed.");
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function parseProviderInput(body: Record<string, unknown>) {
+  const name = requiredString(body.name, "name");
+  const baseUrl = requiredString(body.baseUrl, "baseUrl");
+  if (body.apiKey !== undefined && typeof body.apiKey !== "string") throw new InvalidArgumentError("apiKey must be a string.");
+  if (body.clearApiKey !== undefined && typeof body.clearApiKey !== "boolean") throw new InvalidArgumentError("clearApiKey must be a boolean.");
+  if (body.allowInsecureHttp !== undefined && typeof body.allowInsecureHttp !== "boolean") {
+    throw new InvalidArgumentError("allowInsecureHttp must be a boolean.");
+  }
+  return {
+    name,
+    baseUrl,
+    ...(body.apiKey === undefined ? {} : { apiKey: body.apiKey as string }),
+    ...(body.clearApiKey === true ? { clearApiKey: true } : {}),
+    ...(body.allowInsecureHttp === undefined ? {} : { allowInsecureHttp: body.allowInsecureHttp as boolean }),
+  };
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new InvalidArgumentError(`${field} must be a string.`);
+  return value;
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0) throw new InvalidArgumentError(`${field} must be a non-empty string.`);
+  return value;
+}
+
+function optionalNullableString(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  return requiredString(value, field);
+}
+
+function requireCredentialStore(value: CredentialStore | undefined): CredentialStore {
+  if (value === undefined) throw new CredentialVaultError("Credential vault is not configured for this host.");
+  return value;
+}
+
+function requireProviderFactory(value: OpenAICompatibleProviderFactory | undefined): OpenAICompatibleProviderFactory {
+  if (value === undefined) throw new HttpInputError("OpenAI-compatible provider management is unavailable.");
+  return value;
+}
+
+async function resolveModelForRunIfConfigured(
+  repository: ApplicationRepository & ProviderConfigurationRepository,
+  fallbackProvider: TextGenerationProvider,
+  fallbackModelSelection: WebApiDependencies["fallbackModelSelection"],
+  providerFactory: WebApiDependencies["providerFactory"],
+  credentialStore: WebApiDependencies["credentialStore"],
+  sessionId: string,
+  requestedModelConfigId: string | undefined,
+): Promise<{ provider: TextGenerationProvider; modelSelection?: WebApiDependencies["fallbackModelSelection"] }> {
+  if (providerFactory !== undefined && credentialStore !== undefined) {
+    const resolved = await resolveModelForRun(repository, credentialStore, providerFactory, {
+      sessionId,
+      ...(requestedModelConfigId === undefined ? {} : { requestedModelConfigId }),
+    });
+    if (resolved !== null) return { provider: resolved.provider, modelSelection: resolved.snapshot };
+  } else if (requestedModelConfigId !== undefined) {
+    throw new HttpInputError("Configured model execution is unavailable on this host.");
+  }
+  return {
+    provider: fallbackProvider,
+    ...(fallbackModelSelection === undefined ? {} : { modelSelection: fallbackModelSelection }),
+  };
+}
+
 function toApiFailure(error: unknown): ApiFailure {
+  if (error instanceof HttpSecurityError) {
+    return failure(403, "ORIGIN_FORBIDDEN", error.message);
+  }
   if (error instanceof HttpInputError) {
     return failure(400, "INVALID_REQUEST", error.message);
   }
@@ -344,8 +572,19 @@ function toApiFailure(error: unknown): ApiFailure {
   if (error instanceof StorageError) {
     return failure(500, "STORAGE_ERROR", error.message);
   }
-  if (error instanceof LmStudioProviderError) {
-    return failure(502, "PROVIDER_ERROR", error.message);
+  if (error instanceof CredentialVaultError) {
+    return failure(503, "CREDENTIAL_VAULT_UNAVAILABLE", error.message);
+  }
+  if (error instanceof OpenAICompatibleProviderError) {
+    if (error instanceof LmStudioProviderError) return failure(502, "PROVIDER_ERROR", error.message);
+    const code = error.message.toLowerCase().includes("authorization")
+      ? "PROVIDER_AUTH_ERROR"
+      : error.message.toLowerCase().includes("timed out")
+        ? "PROVIDER_TIMEOUT"
+        : error.message.toLowerCase().includes("could not connect")
+          ? "PROVIDER_CONNECTION_ERROR"
+          : "PROVIDER_ERROR";
+    return failure(error.message.includes("authorization") ? 401 : code === "PROVIDER_TIMEOUT" ? 504 : 502, code, error.message);
   }
   if (error instanceof AgentRuntimeError) {
     return failure(502, error.code, error.message);
@@ -371,3 +610,4 @@ function sendJson(response: ServerResponse, status: number, body: Record<string,
 }
 
 class HttpInputError extends Error {}
+class HttpSecurityError extends Error {}

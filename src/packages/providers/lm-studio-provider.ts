@@ -14,17 +14,34 @@ export interface LmStudioProviderOptions {
   fetcher?: typeof fetch;
 }
 
-export class LmStudioProviderError extends Error {
+export interface OpenAICompatibleProviderOptions {
+  endpoint: string;
+  model: string;
+  apiToken?: string;
+  fetcher?: typeof fetch;
+}
+
+export class OpenAICompatibleProviderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenAICompatibleProviderError";
+  }
+}
+
+export class LmStudioProviderError extends OpenAICompatibleProviderError {
   constructor(message: string) {
     super(message);
     this.name = "LmStudioProviderError";
   }
 }
 
-export class LmStudioProvider implements TextGenerationProvider {
+export class OpenAICompatibleProvider implements TextGenerationProvider {
   private readonly fetcher: typeof fetch;
 
-  constructor(private readonly options: LmStudioProviderOptions) {
+  constructor(
+    private readonly options: OpenAICompatibleProviderOptions,
+    private readonly makeError: (message: string) => OpenAICompatibleProviderError = (message) => new OpenAICompatibleProviderError(message),
+  ) {
     this.fetcher = options.fetcher ?? fetch;
   }
 
@@ -52,29 +69,30 @@ export class LmStudioProvider implements TextGenerationProvider {
     try {
       response = await this.fetcher(this.options.endpoint, {
         method: "POST",
+        redirect: "manual",
         headers,
         body: JSON.stringify(body),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch {
       options.signal?.throwIfAborted();
-      throw new LmStudioProviderError("Could not connect to LM Studio.");
+      throw this.providerError("Could not connect to the configured provider.");
     }
 
     if (!response.ok) {
-      throw new LmStudioProviderError(`LM Studio returned HTTP ${response.status}.`);
+      throw this.providerError(`Provider returned HTTP ${response.status}.`);
     }
 
     let payload: unknown;
     try {
       payload = await response.json();
     } catch {
-      throw new LmStudioProviderError("LM Studio returned an invalid chat completion response.");
+      throw this.providerError("Provider returned an invalid chat completion response.");
     }
 
     const modelResponse = getModelResponse(payload);
     if (modelResponse === null) {
-      throw new LmStudioProviderError("LM Studio returned an invalid chat completion response.");
+      throw this.providerError("Provider returned an invalid chat completion response.");
     }
     return modelResponse;
   }
@@ -90,6 +108,7 @@ export class LmStudioProvider implements TextGenerationProvider {
     try {
       response = await this.fetcher(this.options.endpoint, {
         method: "POST",
+        redirect: "manual",
         headers,
         body: JSON.stringify({
           model: this.options.model,
@@ -103,14 +122,14 @@ export class LmStudioProvider implements TextGenerationProvider {
       });
     } catch {
       options.signal?.throwIfAborted();
-      throw new LmStudioProviderError("Could not connect to LM Studio.");
+      throw this.providerError("Could not connect to the configured provider.");
     }
 
     if (!response.ok) {
-      throw new LmStudioProviderError(`LM Studio returned HTTP ${response.status}.`);
+      throw this.providerError(`Provider returned HTTP ${response.status}.`);
     }
     if (response.body === null) {
-      throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
+      throw this.providerError("Provider returned an invalid chat completion stream.");
     }
 
     let receivedDone = false;
@@ -130,11 +149,11 @@ export class LmStudioProvider implements TextGenerationProvider {
         try {
           payload = JSON.parse(data) as unknown;
         } catch {
-          throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
+          throw this.providerError("Provider returned an invalid chat completion stream.");
         }
         const delta = getStreamDelta(payload);
         if (delta === null) {
-          throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
+          throw this.providerError("Provider returned an invalid chat completion stream.");
         }
         if (delta.reasoning.length > 0) {
           reasoning += delta.reasoning;
@@ -173,27 +192,27 @@ export class LmStudioProvider implements TextGenerationProvider {
     } catch (error) {
       options.signal?.throwIfAborted();
       if (callbackFailed) throw callbackFailure;
-      if (error instanceof LmStudioProviderError) throw error;
-      throw new LmStudioProviderError("LM Studio chat completion stream ended unexpectedly.");
+      if (error instanceof OpenAICompatibleProviderError) throw error;
+      throw this.providerError("Provider chat completion stream ended unexpectedly.");
     }
     options.signal?.throwIfAborted();
     if (!receivedDone) {
-      throw new LmStudioProviderError("LM Studio chat completion stream ended unexpectedly.");
+      throw this.providerError("Provider chat completion stream ended unexpectedly.");
     }
     if (toolCalls.size > 1) {
-      throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+      throw this.providerError("Provider returned an invalid tool call in the streaming response.");
     }
     const reasoningField = reasoning.length > 0 ? { reasoning } : {};
     const [toolCall] = toolCalls.values();
     if (toolCall !== undefined) {
       if (text.length > 0 || toolCall.type !== "function" || toolCall.id.length === 0 || toolCall.name.length === 0) {
-        throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+        throw this.providerError("Provider returned an invalid tool call in the streaming response.");
       }
       let argumentsValue: unknown;
       try {
         argumentsValue = JSON.parse(toolCall.arguments) as unknown;
       } catch {
-        throw new LmStudioProviderError("LM Studio returned an invalid tool call in the streaming response.");
+        throw this.providerError("Provider returned an invalid tool call in the streaming response.");
       }
       return {
         kind: "tool-call",
@@ -204,10 +223,150 @@ export class LmStudioProvider implements TextGenerationProvider {
       };
     }
     if (text.length === 0) {
-      throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
+      throw this.providerError("Provider returned an invalid chat completion stream.");
     }
     return { kind: "final", text, ...reasoningField };
   }
+
+  private providerError(message: string): OpenAICompatibleProviderError {
+    return this.makeError(message);
+  }
+}
+
+export class LmStudioProvider extends OpenAICompatibleProvider {
+  constructor(options: LmStudioProviderOptions) {
+    super(options, (message) => new LmStudioProviderError(toLmStudioErrorMessage(message)));
+  }
+}
+
+export class OpenAICompatibleProviderFactory {
+  constructor(private readonly fetcher: typeof fetch = fetch, private readonly timeoutMs = 10_000, private readonly maxDiscoveryBytes = 1_048_576) {}
+
+  create(input: { baseUrl: string; modelId: string; apiToken?: string }): OpenAICompatibleProvider {
+    const baseUrl = normalizeProviderBaseUrl(input.baseUrl);
+    return new OpenAICompatibleProvider({
+      endpoint: appendEndpoint(baseUrl, "chat/completions"),
+      model: input.modelId,
+      fetcher: this.fetcher,
+      ...(input.apiToken === undefined ? {} : { apiToken: input.apiToken }),
+    });
+  }
+
+  async testConnection(input: { baseUrl: string; apiToken?: string }): Promise<"connected" | "discovery-unavailable"> {
+    const response = await this.requestModels(input);
+    if (response.status === 404 || response.status === 405) return "discovery-unavailable";
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenAICompatibleProviderError(`Provider rejected authorization (HTTP ${response.status}).`);
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenAICompatibleProviderError(`Provider returned HTTP ${response.status} during connection test.`);
+    }
+    try {
+      const payload = await readJsonBodyLimited(response, this.maxDiscoveryBytes);
+      return isModelsPayload(payload) ? "connected" : "discovery-unavailable";
+    } catch (error) {
+      if (error instanceof OpenAICompatibleProviderError) return "discovery-unavailable";
+      throw error;
+    }
+  }
+
+  async discoverModels(input: { baseUrl: string; apiToken?: string }): Promise<string[]> {
+    const response = await this.requestModels(input);
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenAICompatibleProviderError(`Provider rejected authorization (HTTP ${response.status}).`);
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenAICompatibleProviderError(response.status === 404 || response.status === 405
+        ? "Provider does not support model discovery; enter a Model ID manually."
+        : `Provider returned HTTP ${response.status} while listing models.`);
+    }
+    const payload = await readJsonBodyLimited(response, this.maxDiscoveryBytes);
+    if (!isModelsPayload(payload)) throw new OpenAICompatibleProviderError("Provider returned an invalid models response.");
+    const ids = payload.data
+      .map((item) => typeof item === "object" && item !== null ? (item as Record<string, unknown>).id : undefined)
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim());
+    if (ids.length > 500) throw new OpenAICompatibleProviderError("Provider returned too many models to display.");
+    return [...new Set(ids)];
+  }
+
+  private async requestModels(input: { baseUrl: string; apiToken?: string }): Promise<Response> {
+    const baseUrl = normalizeProviderBaseUrl(input.baseUrl);
+    const headers: Record<string, string> = { accept: "application/json" };
+    if (input.apiToken !== undefined) headers.authorization = `Bearer ${input.apiToken}`;
+    try {
+      return await this.fetcher(appendEndpoint(baseUrl, "models"), {
+        method: "GET",
+        redirect: "manual",
+        headers,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new OpenAICompatibleProviderError("Provider connection test timed out.");
+      }
+      throw new OpenAICompatibleProviderError("Could not connect to the configured provider.");
+    }
+  }
+}
+
+function toLmStudioErrorMessage(message: string): string {
+  return message
+    .replace("Could not connect to the configured provider.", "Could not connect to LM Studio.")
+    .replace(/^Provider returned /, "LM Studio returned ")
+    .replace(/^Provider chat /, "LM Studio chat ");
+}
+
+function normalizeProviderBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new OpenAICompatibleProviderError("Base URL must be an absolute HTTP or HTTPS URL.");
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username.length > 0 || url.password.length > 0 || url.search.length > 0 || url.hash.length > 0
+  ) {
+    throw new OpenAICompatibleProviderError("Base URL must use HTTP or HTTPS and must not contain credentials, query, or fragment.");
+  }
+  return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+function appendEndpoint(baseUrl: string, suffix: string): string {
+  return `${baseUrl}/${suffix}`;
+}
+
+async function readJsonBodyLimited(response: Response, maxBytes: number): Promise<unknown> {
+  if (response.body === null) throw new OpenAICompatibleProviderError("Provider returned an empty models response.");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) throw new OpenAICompatibleProviderError("Provider models response exceeded the size limit.");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))) as unknown;
+  } catch {
+    throw new OpenAICompatibleProviderError("Provider returned an invalid models response.");
+  }
+}
+
+function isModelsPayload(value: unknown): value is { data: unknown[] } {
+  return typeof value === "object" && value !== null && Array.isArray((value as Record<string, unknown>).data);
 }
 
 interface StreamToolCall {

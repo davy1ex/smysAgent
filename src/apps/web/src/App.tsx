@@ -15,15 +15,20 @@ import {
 } from "../../web-ui/turn-presentation";
 import {
   createSession,
+  fetchProviderCatalog,
   fetchHistory,
   fetchSessions,
+  setSessionModel,
   sendMessageStream,
   WebApiError,
+  type ModelConfiguration,
+  type ProviderCatalog,
   type SessionHistory,
   type SessionMessage,
   type SessionRecord,
   type SessionSummary,
 } from "./api";
+import { ProviderSettings } from "./ProviderSettings";
 
 const mobileBreakpoint = "(max-width: 760px)";
 
@@ -50,6 +55,7 @@ function MessageItem({
   stepNumber,
   presentation,
   detailedTimeline = false,
+  modelSelection,
 }: {
   message: SessionMessage;
   streaming?: boolean;
@@ -57,6 +63,7 @@ function MessageItem({
   stepNumber?: number;
   presentation?: TurnPresentation | undefined;
   detailedTimeline?: boolean;
+  modelSelection?: { providerName: string; modelName: string };
 }) {
   const isUser = message.role === "user";
   const timelinePresentation = presentation ?? (isUser ? undefined : restoreCompletedReasoning(message.reasoning));
@@ -68,6 +75,7 @@ function MessageItem({
       <div className="message-content">
         <div className="message-meta">
           <strong>{isUser ? "Вы" : "smys"}</strong>
+          {!isUser && modelSelection && <span className="message-model-label">{modelSelection.providerName} · {modelSelection.modelName}</span>}
           <time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>
         </div>
         {!isUser && timelinePresentation && <TurnTimeline presentation={timelinePresentation} detailed={detailedTimeline} />}
@@ -328,6 +336,7 @@ function ChatTimeline({
         const previous = index > 0 ? visibleMessages[index - 1] : undefined;
         const next = visibleMessages[index + 1];
         const presentation = presentationForAssistant(message, previous, history, turnsByUserMessage);
+      const modelSelection = history?.runs.find((run) => run.assistantMessageId === message.id)?.modelSelection;
         const standalonePresentation = message.role === "user" && next?.role !== "assistant"
           ? turnsByUserMessage[message.id]
           : undefined;
@@ -337,6 +346,7 @@ function ChatTimeline({
               message={message}
               streaming={message.id === `${pending?.id}-assistant`}
               presentation={presentation}
+              {...(modelSelection === undefined ? {} : { modelSelection })}
             />
             {standalonePresentation && <TurnTimeline presentation={standalonePresentation} />}
           </Fragment>
@@ -378,6 +388,7 @@ function Trajectory({
             const previous = index > 0 ? visibleMessages[index - 1] : undefined;
             const next = visibleMessages[index + 1];
             const presentation = presentationForAssistant(message, previous, history, turnsByUserMessage);
+            const modelSelection = history?.runs.find((run) => run.assistantMessageId === message.id)?.modelSelection;
             const standalonePresentation = message.role === "user" && next?.role !== "assistant"
               ? turnsByUserMessage[message.id]
               : undefined;
@@ -390,6 +401,7 @@ function Trajectory({
                   streaming={message.id === `${pending?.id}-assistant`}
                   presentation={presentation}
                   detailedTimeline
+                  {...(modelSelection === undefined ? {} : { modelSelection })}
                 />
                 {standalonePresentation && <TurnTimeline presentation={standalonePresentation} detailed />}
               </div>
@@ -505,6 +517,10 @@ function Composer({
   onAllowDemoAddChange,
   onSend,
   onCancel,
+  models,
+  selectedModelConfigId,
+  onSelectModel,
+  onOpenProviderSettings,
 }: {
   disabled: boolean;
   sending: boolean;
@@ -513,6 +529,10 @@ function Composer({
   onAllowDemoAddChange: (allow: boolean) => void;
   onSend: (text: string, allowDemoAdd: boolean) => Promise<void>;
   onCancel: () => void;
+  models: readonly ModelConfiguration[];
+  selectedModelConfigId: string;
+  onSelectModel: (modelConfigId: string) => void;
+  onOpenProviderSettings: () => void;
 }) {
   const [text, setText] = useState("");
 
@@ -552,7 +572,11 @@ function Composer({
         <div className="composer-toolbar">
           <span className="composer-note">Enter — отправить · Shift+Enter — новая строка</span>
           <div className="composer-controls">
-            <span className="composer-model">Локальная модель</span>
+            <select className="composer-model-select" aria-label="Модель для этой сессии" value={selectedModelConfigId} disabled={sending} onChange={(event) => onSelectModel(event.target.value)}>
+              <option value="">Модель по умолчанию</option>
+              {models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}
+            </select>
+            <button className="composer-settings-button" type="button" onClick={onOpenProviderSettings} aria-label="Настроить провайдеры и модели">Модели</button>
             {sending
               ? <button className="stop-button" type="button" onClick={onCancel}>Остановить</button>
               : <button className="send-button" type="submit" aria-label="Отправить сообщение" disabled={disabled || text.trim().length === 0}>
@@ -570,6 +594,8 @@ export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [historyBySession, setHistoryBySession] = useState<Readonly<Record<string, SessionHistory>>>({});
+  const [providerCatalog, setProviderCatalog] = useState<ProviderCatalog | null>(null);
+  const [providerSettingsOpen, setProviderSettingsOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "trajectory">("chat");
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(mobileBreakpoint).matches);
@@ -593,6 +619,31 @@ export function App() {
       if (!cancelled) setError(errorMessage(cause));
     }).finally(() => {
       if (!cancelled) setLoadingSessions(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const refreshProviderCatalog = async () => {
+    const catalog = await fetchProviderCatalog();
+    setProviderCatalog(catalog);
+    setSessions(await fetchSessions());
+  };
+
+  const openProviderSettings = async () => {
+    try {
+      if (providerCatalog === null) await refreshProviderCatalog();
+      setProviderSettingsOpen(true);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchProviderCatalog().then((catalog) => {
+      if (!cancelled) setProviderCatalog(catalog);
+    }).catch((cause: unknown) => {
+      if (!cancelled) setError(errorMessage(cause));
     });
     return () => { cancelled = true; };
   }, []);
@@ -637,6 +688,40 @@ export function App() {
 
   const selected = sessions.find((session) => session.id === activeSessionId);
   const selectedHistory = activeSessionId ? historyBySession[activeSessionId] : undefined;
+  const effectiveModelConfigId = selected?.selectedModelConfigId ?? providerCatalog?.defaultModelConfigId ?? "";
+
+  const selectSessionModel = async (modelConfigId: string) => {
+    if (!selected || sending) return;
+    const selection = modelConfigId || null;
+    setError("");
+    try {
+      await setSessionModel(selected.id, selection);
+      setSessions((current) => current.map((session) => {
+        if (session.id !== selected.id) return session;
+        const updated = { ...session };
+        if (selection === null) delete updated.selectedModelConfigId;
+        else updated.selectedModelConfigId = selection;
+        return updated;
+      }));
+      setHistoryBySession((current) => {
+        const history = current[selected.id];
+        return history === undefined ? current : {
+          ...current,
+          [selected.id]: {
+            ...history,
+            session: (() => {
+              const updated = { ...history.session };
+              if (selection === null) delete updated.selectedModelConfigId;
+              else updated.selectedModelConfigId = selection;
+              return updated;
+            })(),
+          },
+        };
+      });
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
 
   const createNewSession = async () => {
     setError("");
@@ -731,6 +816,8 @@ export function App() {
         };
       });
       setPending(null);
+      const refreshedHistory = await fetchHistory(sessionId);
+      setHistoryBySession((current) => ({ ...current, [sessionId]: refreshedHistory }));
       setSessions(await fetchSessions());
     } catch (cause) {
       const message = errorMessage(cause);
@@ -855,8 +942,9 @@ export function App() {
               : <div className="empty-state"><Icon name="chat" size={20} /><strong>Начните новый диалог</strong><span>Создайте сессию, чтобы отправить запрос агенту.</span><button type="button" onClick={() => { void createNewSession(); }}>Создать чат</button></div>}
         </section>
 
-        <Composer disabled={!selected} sending={sending} error={error} allowDemoAdd={allowDemoAdd} onAllowDemoAddChange={setAllowDemoAdd} onSend={submitMessage} onCancel={cancelCurrentTurn} />
+        <Composer disabled={!selected} sending={sending} error={error} allowDemoAdd={allowDemoAdd} onAllowDemoAddChange={setAllowDemoAdd} onSend={submitMessage} onCancel={cancelCurrentTurn} models={providerCatalog?.models ?? []} selectedModelConfigId={effectiveModelConfigId} onSelectModel={(modelConfigId) => { void selectSessionModel(modelConfigId); }} onOpenProviderSettings={() => { void openProviderSettings(); }} />
       </main>
+      {providerSettingsOpen && providerCatalog && <ProviderSettings catalog={providerCatalog} onClose={() => setProviderSettingsOpen(false)} onRefresh={refreshProviderCatalog} />}
     </div>
   );
 }

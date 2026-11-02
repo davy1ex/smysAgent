@@ -1,6 +1,19 @@
 export { InvalidArgumentError, SessionNotFoundError } from "./errors";
 export { AgentRuntimeError } from "../core/agent";
 export { createDemoAddTool } from "./demo-tools";
+export {
+  deleteModelConfiguration,
+  deleteProviderConfiguration,
+  discoverConfiguredProviderModels,
+  getProviderCatalog,
+  resolveModelForRun,
+  saveModelConfiguration,
+  saveProviderConfiguration,
+  setDefaultModelConfiguration,
+  setSessionModelConfiguration,
+  testConfiguredProviderConnection,
+} from "./provider-configuration";
+export type { ProviderCatalog, ProviderConfigurationView, ResolvedModelForRun } from "./provider-configuration";
 export type {
   AgentExecutionOptions,
   AgentRunRepository,
@@ -8,6 +21,14 @@ export type {
   ApplicationRepository,
   AssistantMessageDraft,
   CompletedAgentRun,
+  CredentialStore,
+  ModelCapabilities,
+  ModelCapabilityStatus,
+  ModelConfiguration,
+  ModelSelectionSnapshot,
+  OpenAICompatibleProviderFactory,
+  ProviderConfiguration,
+  ProviderConfigurationRepository,
   SessionRepository,
   UserMessageDraft,
 } from "./ports";

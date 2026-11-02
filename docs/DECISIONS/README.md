@@ -25,7 +25,8 @@ AI может исследовать варианты, подготовить п
 - [ADR-0013: Потоковая передача reasoning deltas](ADR-0013-live-reasoning-deltas.md) — необязательный provider callback и per-model-call `reasoning.delta` event через существующий Core/Event/SSE путь; `reasoning.completed` остаётся canonical завершением блока.
 - [ADR-0014: Безопасный Markdown в Web ответах](ADR-0014-safe-markdown-web.md) — Web UI рендерит assistant streaming/final content через `react-markdown` и `remark-gfm`, не включая raw HTML.
 - [ADR-0015: Сохранение reasoning завершённых ходов](ADR-0015-persist-completed-reasoning.md) — историческое решение JSON v3, superseded by ADR-0016.
-- [ADR-0016: SQLite и trajectory завершённых AgentRun](ADR-0016-sqlite-completed-runs.md) — `Accepted` · `Implemented`; SQLite через `better-sqlite3` 12.9.0, отдельный AgentRunRepository, атомарная запись завершённого ответа и trace, однократный импорт JSON v1/v2/v3; active inference/replay не входят.
+- [ADR-0016: SQLite и trajectory завершённых AgentRun](ADR-0016-sqlite-completed-runs.md) — `Accepted` · `Implemented`; SQLite через `better-sqlite3` 12.9.0, отдельный AgentRunRepository, атомарная запись завершённого ответа и trace, однократный импорт JSON v1/v2/v3. Изначальная schema v1 повышена до v2 в ADR-0017; active inference/replay не входят.
+- [ADR-0017: Provider и model configuration](ADR-0017-provider-model-configuration.md) — `Accepted` · `Implemented`; общий Application resolver, OpenAI-compatible Chat Completions adapter, SQLite schema v2, системный credential vault и session/global model selection.
 
 ## Шаблон
 

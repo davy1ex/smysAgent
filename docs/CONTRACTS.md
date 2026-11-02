@@ -1,6 +1,6 @@
 # Contracts
 
-**Статус:** разделы Application API, local Web HTTP API, CLI и SQLite storage описывают реализованные контракты. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; единое исполнение, event streaming, completed reasoning и AgentRun persistence — в ADR-0012—0016. Active run replay остаётся будущим сценарием.
+**Статус:** разделы Application API, local Web HTTP API, CLI и SQLite storage описывают реализованные контракты. Ограниченный agent loop и tool-calling provider зафиксированы в ADR-0004; единое исполнение, event streaming, completed reasoning, AgentRun persistence и provider/model configuration — в ADR-0012—0017. Active run replay остаётся будущим сценарием.
 
 ## Принципы проектирования
 
@@ -18,7 +18,7 @@ Application API — внутренний интерфейс use cases, чере�
 
 Тесты могут вызывать use cases напрямую с подменёнными портами. React-клиент вызывает HTTP transport и не импортирует Application, Core или providers.
 
-CLI — ранний headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход через явно выбранный fake или LM Studio provider и чтение истории. По умолчанию CLI не передаёт инструменты; для smoke-сценария можно явно подключить встроенный `demo.add` и отдельно разрешить его исполнение. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
+CLI — headless-вход для ручного запуска, скриптов, Codex и диагностики. Контракт покрывает создание сессии, отправку сообщения без модели, ход по сохранённому provider/model selection или через legacy fake/LM Studio flags/env, а также чтение истории. `--model-config-id` задаёт одноразовый override; без него действует session selection, global default и затем legacy env. По умолчанию CLI не передаёт инструменты; для smoke-сценария можно явно подключить встроенный `demo.add` и отдельно разрешить его исполнение. Скриптовый режим поддерживает JSON в stdout и стабильные коды завершения; формы приведены ниже. Unit/integration тесты запускаются package scripts и могут вызывать application API напрямую.
 
 CLI не содержит собственной реализации agent loop. Он передаёт подключённый инструмент и permission policy в application use case; runtime проверяет вызов и permission до исполнения. Scheduler/worker не реализован; правила расписания, повторы и восстановление потребуют отдельного контракта до появления такого входа.
 
@@ -30,9 +30,9 @@ CLI не содержит собственной реализации agent loop
 
 ```ts
 createSession(repository: SessionRepository): Promise<Session>
-listSessions(repository: SessionRepository): Promise<SessionSummary[]>
+listSessions(repository: SessionRepository, modelSelections?: Pick<ProviderConfigurationRepository, "getSessionModelConfigId">): Promise<SessionSummary[]>
 sendMessage(repository: SessionRepository, input: { sessionId: string; text: string }): Promise<UserMessage>
-executeTurn(repository: ApplicationRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
+executeTurn(repository: ApplicationRepository, provider: TextGenerationProvider, input: { sessionId: string; text: string; runId?: string; modelSelection?: ModelSelectionSnapshot }, options?: AgentExecutionOptions): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }>
 runAgentTurn(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> // compatibility delegate
 runAgentTurnStreaming(...): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }> // compatibility delegate
 getHistory(repository: SessionRepository, sessionId: string): Promise<SessionHistory>
@@ -43,6 +43,7 @@ interface SessionSummary {
   createdAt: string;
   updatedAt: string;
   title: string;
+  selectedModelConfigId?: string;
 }
 
 interface SessionRepository {
@@ -67,6 +68,15 @@ interface CompletedAgentRun {
   startedAt: string;
   completedAt: string;
   steps: AgentRunStep[];
+  modelSelection?: ModelSelectionSnapshot;
+}
+
+interface ModelSelectionSnapshot {
+  providerId: string;
+  providerName: string;
+  modelConfigId: string;
+  modelId: string;
+  modelName: string;
 }
 
 interface AgentRunRepository {
@@ -123,19 +133,35 @@ interface AgentTurnStreamHandlers {
 
 `listSessions` вычисляет заголовок по первому user message (или `Новый чат`) и `updatedAt` по последнему сообщению. `sendMessage` сохраняет пользовательское текстовое сообщение и не вызывает модель или инструменты. `executeTurn` сохраняет пользователя, загружает историю и запускает единый runtime. После успеха он вызывает `completeRun()`, который одной транзакцией сохраняет финальный assistant message и ordered trace с `runId`, `sessionId`, `userMessageId` и `assistantMessageId`. Assistant text не копируется в trace. `reasoning.completed` сохраняется по одному разу на вызов модели; стриминговые deltas не записываются. При наличии reasoning API также возвращает его агрегированную строку. `getSessionTrajectory` собирает историю сообщений и завершённые runs; старые сообщения без run допустимы. CLI по умолчанию не передаёт инструменты; `--tool demo.add` подключает его, а отдельный `--allow-tool demo.add` разрешает исполнение. Web передаёт `allowTools` только после явного выбора для текущего хода. При ошибке или отмене после записи пользователя ответ и trace не сохраняются. Порт репозитория назначает следующий `sequence` среди всех сообщений сессии; application API преобразует отсутствие сессии в `SessionNotFoundError`.
 
+Application provider/model use cases находятся в `provider-configuration.ts`: `getProviderCatalog`, `saveProviderConfiguration`, `deleteProviderConfiguration`, `testConfiguredProviderConnection`, `discoverConfiguredProviderModels`, `saveModelConfiguration`, `deleteModelConfiguration`, `setDefaultModelConfiguration`, `setSessionModelConfiguration` и `resolveModelForRun`. Разделённые `ProviderConfigurationRepository`, `CredentialStore` и `OpenAICompatibleProviderFactory` передаются host-ом; Core не знает о них. Resolver применяет явный per-run ID, затем сохранённый session selection, затем global default. В Web выбор композера сохраняется на сессию; CLI `--model-config-id` не изменяет selection. Перед новым ходом resolver создаёт provider с фиксированными endpoint, Model ID и credential; завершённый `AgentRun` получает неизменяемый snapshot. Уже выполняемый Run не переключается при последующем редактировании конфигурации.
+
+Provider record хранит имя, protocol, Base URL, ссылку на credential и HTTP-разрешение; model record отдельно хранит provider ID, exact Model ID, display name, source и tri-state capabilities `unknown | supported | unsupported` для streaming, tool calling и reasoning. Обнаружение через `/models` оставляет каждую capability `unknown`. Возможности считаются подтверждёнными только при достоверном источнике или явной проверке.
+
 Необязательный `onEvent` получает события последовательно при обоих режимах provider. Runtime отправляет `model.started`, `model.completed`, reasoning deltas/completions, `tool.requested`, `tool.started`, `tool.completed` и, если задан `onTextDelta`, `assistant.delta`. `callIndex` начинается с 1. `tool.requested` описывает запрос модели до валидации и проверки разрешений; `tool.started` означает, что проверка пройдена и исполнение начинается. Lifecycle-события Application связаны с persistence: `turn.started` идёт после записи user message, `turn.completed` — после атомарного сохранения assistant message и completed run и может содержать агрегированное `reasoning`; `turn.failed` содержит безопасный код ошибки, а исходная ошибка повторно выбрасывается. Полный event journal не записывается; Application формирует trace steps из model/reasoning/tool events, игнорируя reasoning deltas для persistence.
 
 ### Local Web HTTP API
 
 Host `src/apps/web-host` слушает только `127.0.0.1` (порт по умолчанию `3001`). В dev-режиме Vite проксирует `/api` к этому host. API не использует CORS или аутентификацию; потоковый endpoint отвечает `text/event-stream`, остальные endpoints — JSON.
 
+Изменяющие provider/model routes проверяют loopback Host и, если заголовок задан, exact same-host loopback Origin; CORS не включён. Это local UI API, не произвольный сетевой management API. Base URL валидируется как абсолютный HTTP(S) без userinfo/query/fragment. Remote HTTP требует явного подтверждения. Проверка и discovery принимают provider ID и используют сохранённую конфигурацию; тело не может подменить endpoint или credentials. Запросы с Bearer key используют `redirect: manual`. `/models` проверяет только доступность endpoint; наличие модели не доказывает поддержку streaming, tools или reasoning. Capabilities получают `unknown`, пока достоверный источник или проверка не подтвердят состояние.
+
+Web UI сохраняет выбранную в composer модель как selection сессии; API и CLI могут передать `modelConfigId` как override конкретного запуска. Приоритет: явный per-run ID → session selection → global default. CLI и Web используют один SQLite store и Application resolver. Provider/model разрешаются перед каждым ходом, а completed AgentRun хранит фактический snapshot; уже созданный provider активного Run не меняется.
+
 | Метод и путь | Поведение |
 | --- | --- |
-| `GET /api/sessions` | Возвращает `{ ok, sessions }`; элемент содержит `id`, `createdAt`, `updatedAt`, `title`. |
-| `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию и возвращает `{ ok, session }` с HTTP 201. |
-| `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages, runs }`: сообщения по `sequence`, completed run traces в порядке user messages. Legacy assistant messages могут содержать per-call `reasoning`; новые reasoning blocks находятся в `runs[].steps`. |
-| `POST /api/sessions/:id/messages` | Принимает `{ text, allowTools? }`, вызывает `executeTurn` и возвращает `runId`, `userMessage`, `assistantMessage` и необязательный `reasoning`. Запрос ждёт завершения provider. |
-| `POST /api/sessions/:id/messages/stream` | Принимает `{ text, allowTools? }`, вызывает тот же `executeTurn` и возвращает SSE lifecycle, model, reasoning, tool и text-delta events. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. |
+| `GET /api/sessions` | Возвращает `{ ok, sessions }`; элемент содержит `id`, `createdAt`, `updatedAt`, `title` и optional `selectedModelConfigId` из Application config repository. |
+| `POST /api/sessions` | Принимает `{}`; создаёт пустую сессию без закрепления global default и возвращает `{ ok, session }` с HTTP 201. |
+| `GET /api/sessions/:id/history` | Возвращает `{ ok, session, messages, runs }`: Core session и сообщения по `sequence`, completed run traces в порядке user messages. Legacy assistant messages могут содержать per-call `reasoning`; новые reasoning blocks находятся в `runs[].steps`. Model selection — отдельная Application metadata в `GET /api/sessions`. |
+| `POST /api/sessions/:id/messages` | Принимает `{ text, allowTools?, modelConfigId? }`, вызывает `executeTurn` и возвращает `runId`, `userMessage`, `assistantMessage` и необязательный `reasoning`. Запрос ждёт завершения provider. |
+| `POST /api/sessions/:id/messages/stream` | Принимает `{ text, allowTools?, modelConfigId? }`, вызывает тот же `executeTurn` и возвращает SSE lifecycle, model, reasoning, tool и text-delta events. Браузер читает поток через `fetch()`; разрыв соединения передаёт `AbortSignal` provider. |
+| `GET /api/provider-config` | Возвращает providers без credential references, models с capabilities, global default и признак поддержки credential vault текущей платформой. API keys не возвращает. |
+| `POST /api/providers`, `PUT /api/providers/:id` | Принимает `{ name, baseUrl, apiKey?, clearApiKey?, allowInsecureHttp? }`; создаёт или обновляет OpenAI-compatible provider, а API key при наличии передаётся только в системный vault. Ответ содержит provider без secret/reference и `hasCredential`. |
+| `DELETE /api/providers/:id` | Удаляет provider и связанные model configs/credential entry. |
+| `POST /api/providers/:id/test` | Проверяет сохранённый provider по ID через `/models`; возвращает `connected` либо `discovery-unavailable`, body не задаёт endpoint или credentials. |
+| `POST /api/providers/:id/models/discover` | Читает `/models` сохранённого provider и сохраняет model IDs с capabilities `unknown`; лимиты 10 секунд, 1 MiB и 500 IDs. |
+| `POST /api/models`, `DELETE /api/models/:id` | `POST` принимает `{ providerId, modelId, displayName? }`, добавляет точный Model ID вручную; DELETE удаляет model config. |
+| `PUT /api/settings/default-model` | Устанавливает global default model config или `null`. |
+| `PATCH /api/sessions/:id/model` | Сохраняет модель сессии или `null` для использования global default. |
 
 Формат SSE события — `event: <type>` и одна JSON-строка `data:`. В payload каждого события есть `runId`. Lifecycle-события содержат `{ userMessage }`, `{ assistantMessage, reasoning? }` или `{ error: { code, message, turnId? } }`; aggregate `reasoning` остаётся совместимым полем события, а новый `assistantMessage` не дублирует его. Остальные используют поля соответствующего `AgentRuntimeEvent`. Начальное событие отправляется после сохранения user message. Дельты текста и reasoning во время исполнения остаются временными; Application сохраняет финальный ответ и full completed trace одной транзакцией только после успешного завершения provider. `turn.completed` отправляется после успешной транзакции. Если поток прерывается или запись завершается ошибкой, Web host отправляет `turn.failed` и сохраняет user message без частичного assistant или completed run. После отправки SSE headers HTTP status уже `200`, поэтому ошибки хода передаются событием; ошибки разбора HTTP-запроса до начала потока используют JSON error contract.
 
@@ -161,7 +187,7 @@ cd src/apps/web && npm run dev
 
 Для LM Studio в первом терминале задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL=<model-id>` перед `npm run web:host`.
 
-Fake provider используется по умолчанию. Для LM Studio задать `SMYS_PROVIDER=lm-studio` и `LM_STUDIO_MODEL`; endpoint берётся из `LM_STUDIO_ENDPOINT` или `http://localhost:1234/v1/chat/completions`, токен — из необязательного `LM_API_TOKEN`. `SMYS_DATA_DIR` задаёт каталог SQLite store, `SMYS_WEB_PORT` — порт API, `SMYS_API_URL` — target Vite proxy.
+Fake provider используется по умолчанию как legacy fallback. Настройки из UI имеют приоритет и применяются без перезапуска host. Переменные SMYS_PROVIDER, LM_STUDIO_MODEL, LM_STUDIO_ENDPOINT и необязательный LM_API_TOKEN остаются для старого сценария. SMYS_DATA_DIR задаёт общий SQLite store Web и CLI; SMYS_WEB_PORT задаёт API port, SMYS_API_URL — Vite proxy. API keys хранятся в macOS Keychain; на других платформах операция завершается ошибкой без plaintext fallback.
 
 В текущей реализации `Message` — объединение `UserMessage` и `AssistantMessage`; оба типа имеют ровно одну текстовую часть. Более широкий набор ролей и content parts ниже остаётся черновой моделью для будущих сценариев.
 
@@ -171,6 +197,7 @@ Fake provider используется по умолчанию. Для LM Studio
 session create [--initial-message <text>] [--data-dir <path>] [--json]
 message send --session-id <id> --text <text> [--data-dir <path>] [--json]
 history get --session-id <id> [--data-dir <path>] [--json]
+agent run [--model-config-id <id>] --session-id <id> --text <text> [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json] [--stream [--output ndjson]]
 agent run --provider fake --session-id <id> --text <text> [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json] [--stream [--output ndjson]]
 agent run --provider lm-studio --model <model-id> --session-id <id> --text <text> [--endpoint <url>] [--tool demo.add] [--allow-tool demo.add] [--data-dir <path>] [--json] [--stream [--output ndjson]]
 ```
@@ -197,11 +224,11 @@ agent run --provider lm-studio --model <model-id> --session-id <id> --text <text
 
 Если provider возвращает непустой reasoning, JSON-ответ `agent run` содержит верхнеуровневое поле `reasoning`; обычный текстовый вывод печатает его перед финальным ответом, а `--stream` направляет reasoning в stderr. Per-call blocks сохраняются в completed AgentRun trace; верхнеуровневая агрегированная строка остаётся совместимым результатом текущего вызова.
 
-`agent run` требует явный `--provider`. Для `fake` параметры `--model` и `--endpoint` запрещены. Для `lm-studio` обязателен непустой `--model`; он должен соответствовать идентификатору модели LM Studio. `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. Если сервер требует авторизацию, необязательная переменная `LM_API_TOKEN` передаётся в заголовке Bearer. Токен не сохраняется в сообщениях или хранилище и не выводится в ошибках. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
+`agent run` может использовать сохранённую конфигурацию: явный `--model-config-id`, затем session selection и global default. В этом режиме `--provider`, `--model` и `--endpoint` несовместимы с `--model-config-id`. Если сохранённый выбор отсутствует, legacy путь поддерживает `--provider fake|lm-studio` либо `SMYS_PROVIDER`; для `lm-studio` обязателен непустой `--model` или `LM_STUDIO_MODEL`. Для legacy LM Studio `--endpoint` — полный URL запроса, а не base URL: приоритет имеют `--endpoint`, переменная `LM_STUDIO_ENDPOINT`, затем `http://localhost:1234/v1/chat/completions`. При наличии `LM_API_TOKEN` токен передаётся в Bearer заголовке и не сохраняется в сообщениях/SQLite. Без `--tool` provider получает обычный текстовый запрос без tool definitions. `--tool demo.add` подключает безопасную функцию сложения двух чисел; `--allow-tool demo.add` отдельно разрешает исполнение. Разрешающий флаг без подключения инструмента отклоняется как ошибка аргументов. Если инструмент подключён без разрешающего флага и модель запросит его, runtime отклонит вызов.
 
 Ручной provider smoke test выполняется командой `npm run smoke:lm-studio`; она требует `LM_STUDIO_MODEL`, использует `LM_STUDIO_ENDPOINT` или стандартный endpoint и при наличии передаёт `LM_API_TOKEN`. Команда делает один non-streaming текстовый запрос и возвращает JSON в stdout/stderr. Она не входит в `npm test` и требует запущенный локальный LM Studio server.
 
-Каталог хранилища выбирается по приоритету: `--data-dir`, переменная окружения `SMYS_DATA_DIR`, затем `.smys-agent` в папке запуска CLI. При запуске через npm используется исходная папка вызова npm (`INIT_CWD`). Пути относительно папки запуска разрешаются от неё. Активная БД — `store.sqlite` с `user_version: 1`; она хранит sessions, messages, completed runs и упорядоченные run steps. Сообщения имеют роль `user` или `assistant`, одну текстовую часть `content`, ISO-время и целый `sequence`, уникальный в пределах сессии. Только импортированное legacy assistant message может содержать `reasoning` массив `{ callIndex, text }`; новые reasoning блоки живут в trace.
+Каталог хранилища выбирается по приоритету: `--data-dir`, переменная окружения `SMYS_DATA_DIR`, затем `.smys-agent` в папке запуска CLI. При запуске через npm используется исходная папка вызова npm (`INIT_CWD`). Пути относительно папки запуска разрешаются от неё. Активная БД — `store.sqlite` с `user_version: 2`; она хранит sessions, messages, completed runs, ordered steps, provider/model configs и model selections. SQLite содержит только credential reference; secret хранится в macOS Keychain. На неподдерживаемых платформах сохранение credentials завершается ошибкой без plaintext fallback. Schema v1 мигрирует транзакционно в v2. Completed AgentRun хранит фактически выбранный provider/model snapshot. Сообщения имеют роль `user` или `assistant`, одну текстовую часть `content`, ISO-время и целый `sequence`, уникальный в пределах сессии. Только импортированное legacy assistant message может содержать `reasoning` массив `{ callIndex, text }`; новые reasoning блоки живут в trace.
 
 При первой инициализации новой SQLite БД существующий валидный JSON v1/v2/v3 импортируется один раз транзакционно; исходные bytes сохраняются в `store.json.vN.sqlite.bak`. Импорт переносит sessions/messages, IDs, sequence, timestamps, legacy reasoning и дополнительные JSON поля; old runs не реконструируются, поэтому их traces пусты. При существующей SQLite БД JSON не читается повторно и не используется для записи. Неизвестная версия и повреждённый JSON отклоняются без изменения исходника. Если импорт не завершается, новая БД удаляется, а JSON остаётся источником для следующего запуска. После импорта downgrade на старый JSON-only host без экспорта теряет новые данные; SQLite БД следует сохранить для отката.
 
@@ -314,7 +341,7 @@ Runtime ограничивает ход двумя запросами модел
 - экспортировать данные в собственном документированном формате;
 - предоставить поток/подписку на изменения для обновления UI и восстановления после перезапуска.
 
-Для активной SQLite schema v1 versioning выполняется через `PRAGMA user_version`; JSON v1/v2/v3 importer описан выше. SQLite завершение run атомарно фиксирует assistant message и trace, а `busy_timeout` ждёт короткие конкурирующие записи. Idempotency повторной команды, active event journal, replay и общий экспорт всех run payload остаются открытыми.
+Для активной SQLite schema v2 versioning выполняется через `PRAGMA user_version`; JSON v1/v2/v3 importer описан выше. SQLite завершение run атомарно фиксирует assistant message, trace и model snapshot, а `busy_timeout` ждёт короткие конкурирующие записи. Idempotency повторной команды, active event journal, replay и общий экспорт всех run payload остаются открытыми.
 
 ## Черновик: record/replay
 

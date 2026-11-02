@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
@@ -25,6 +26,13 @@ test("SQLite stores ordered completed run steps and keeps them after reopening",
       status: "completed",
       startedAt: "2026-11-02T08:01:00.000Z",
       completedAt: "2026-11-02T08:01:04.000Z",
+      modelSelection: {
+        providerId: "provider-1",
+        providerName: "Local provider",
+        modelConfigId: "model-config-1",
+        modelId: "model-a",
+        modelName: "Model A",
+      },
       steps: [
         { type: "model", callIndex: 1, phase: "waiting" },
         { type: "reasoning", callIndex: 1, text: "Prepare calculation.\nSecond line." },
@@ -60,6 +68,93 @@ test("SQLite stores ordered completed run steps and keeps them after reopening",
   ]);
   assert.equal(runs[0]?.userMessageId, "user-1");
   assert.equal(runs[0]?.assistantMessageId, "assistant-1");
+  assert.deepEqual(runs[0]?.modelSelection, {
+    providerId: "provider-1",
+    providerName: "Local provider",
+    modelConfigId: "model-config-1",
+    modelId: "model-a",
+    modelName: "Model A",
+  });
+});
+
+test("SQLite keeps provider/model configuration and selections after reopening", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-sqlite-provider-config-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const repository = new SqliteApplicationRepository(dataDir);
+  await repository.createSession({ id: "config-session", createdAt: "2026-11-02T08:00:00.000Z" });
+  await repository.saveProviderConfiguration({
+    id: "provider-1",
+    name: "Local provider",
+    protocol: "openai-chat-completions",
+    baseUrl: "http://127.0.0.1:1234/v1",
+    credentialRef: "vault-reference-only",
+    allowInsecureHttp: false,
+    createdAt: "2026-11-02T08:00:00.000Z",
+    updatedAt: "2026-11-02T08:00:00.000Z",
+  });
+  await repository.saveModelConfiguration({
+    id: "model-config-1",
+    providerId: "provider-1",
+    modelId: "model-a",
+    displayName: "Model A",
+    source: "manual",
+    capabilities: { streaming: "unknown", toolCalling: "unknown", reasoning: "unknown" },
+    createdAt: "2026-11-02T08:00:00.000Z",
+    updatedAt: "2026-11-02T08:00:00.000Z",
+  });
+  await repository.setDefaultModelConfigId("model-config-1");
+  await repository.setSessionModelConfigId("config-session", "model-config-1");
+  await repository.close();
+
+  const reopened = new SqliteApplicationRepository(dataDir);
+  const providers = await reopened.listProviderConfigurations();
+  const models = await reopened.listModelConfigurations();
+  const defaultModelConfigId = await reopened.getDefaultModelConfigId();
+  const sessionModelConfigId = await reopened.getSessionModelConfigId("config-session");
+  await reopened.close();
+
+  assert.equal(providers[0]?.credentialRef, "vault-reference-only");
+  assert.equal(providers[0]?.baseUrl, "http://127.0.0.1:1234/v1");
+  assert.equal(models[0]?.modelId, "model-a");
+  assert.equal(defaultModelConfigId, "model-config-1");
+  assert.equal(sessionModelConfigId, "model-config-1");
+});
+
+test("SQLite schema v1 migrates in place to provider and model configuration", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-sqlite-v1-migration-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const database = new Database(join(dataDir, "store.sqlite"));
+  database.exec(`
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, extra_json TEXT NOT NULL DEFAULT '{}');
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sequence INTEGER NOT NULL, role TEXT NOT NULL,
+      content_text TEXT NOT NULL, created_at TEXT NOT NULL, reasoning_json TEXT, extra_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE agent_runs (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, user_message_id TEXT NOT NULL,
+      assistant_message_id TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL
+    );
+    CREATE TABLE agent_run_steps (run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, step_json TEXT NOT NULL);
+    CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
+    INSERT INTO sessions (id, created_at) VALUES ('legacy-session', '2026-11-02T08:00:00.000Z');
+    INSERT INTO messages (id, session_id, sequence, role, content_text, created_at)
+      VALUES ('legacy-user', 'legacy-session', 1, 'user', 'before migration', '2026-11-02T08:01:00.000Z');
+    PRAGMA user_version = 1;
+  `);
+  database.close();
+
+  const migrated = new SqliteApplicationRepository(dataDir);
+  const history = await migrated.getHistory("legacy-session");
+  assert.equal(history?.messages[0]?.content[0]?.text, "before migration");
+  assert.equal(await migrated.getSessionModelConfigId("legacy-session"), null);
+  assert.deepEqual(await migrated.listCompletedRuns("legacy-session"), []);
+  await migrated.close();
+
+  const check = new Database(join(dataDir, "store.sqlite"), { readonly: true });
+  assert.equal(check.pragma("user_version", { simple: true }), 2);
+  const configTables = check.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('provider_configs', 'model_configs') ORDER BY name").all();
+  assert.deepEqual(configTables, [{ name: "model_configs" }, { name: "provider_configs" }]);
+  check.close();
 });
 
 test("SQLite imports JSON v1, v2, and v3 once, retaining legacy reasoning and exact backups", async (t) => {

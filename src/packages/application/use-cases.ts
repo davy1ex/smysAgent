@@ -7,7 +7,15 @@ import {
 } from "../core/agent";
 import type { AssistantMessage, AssistantReasoning, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
-import type { AgentExecutionOptions, AgentRunStep, ApplicationRepository, CompletedAgentRun, SessionRepository } from "./ports";
+import type {
+  AgentExecutionOptions,
+  AgentRunStep,
+  ApplicationRepository,
+  CompletedAgentRun,
+  ModelSelectionSnapshot,
+  ProviderConfigurationRepository,
+  SessionRepository,
+} from "./ports";
 
 export async function createSession(repository: SessionRepository): Promise<Session> {
   const session: Session = {
@@ -23,23 +31,28 @@ export interface SessionSummary {
   createdAt: string;
   updatedAt: string;
   title: string;
+  selectedModelConfigId?: string;
 }
 
-export async function listSessions(repository: SessionRepository): Promise<SessionSummary[]> {
+export async function listSessions(
+  repository: SessionRepository,
+  modelSelections?: Pick<ProviderConfigurationRepository, "getSessionModelConfigId">,
+): Promise<SessionSummary[]> {
   const histories = await repository.listSessionHistories();
-  return histories
-    .map(({ session, messages }): SessionSummary => {
+  const summaries = await Promise.all(histories.map(async ({ session, messages }): Promise<SessionSummary> => {
       const firstUserMessage = messages.find((message) => message.role === "user");
       const title = firstUserMessage?.content[0]?.text.trim() || "Новый чат";
       const lastMessage = messages.at(-1);
+      const selectedModelConfigId = await modelSelections?.getSessionModelConfigId(session.id);
       return {
         id: session.id,
         createdAt: session.createdAt,
         updatedAt: lastMessage?.createdAt ?? session.createdAt,
         title,
+        ...(selectedModelConfigId === null || selectedModelConfigId === undefined ? {} : { selectedModelConfigId }),
       };
-    })
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    }));
+  return summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
 export async function sendMessage(
@@ -67,7 +80,7 @@ export async function sendMessage(
 export async function executeTurn(
   repository: ApplicationRepository,
   provider: TextGenerationProvider,
-  input: { sessionId: SessionId; text: string; runId?: string },
+  input: { sessionId: SessionId; text: string; runId?: string; modelSelection?: ModelSelectionSnapshot },
   agentOptions: AgentExecutionOptions = {},
 ): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage; reasoning?: string }> {
   const runId = input.runId ?? randomUUID();
@@ -142,6 +155,7 @@ export async function executeTurn(
         startedAt,
         completedAt: new Date().toISOString(),
         steps,
+        ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
       },
       assistantMessage: assistantMessageDraft,
     });
@@ -171,7 +185,7 @@ export async function executeTurn(
 export async function runAgentTurn(
   repository: ApplicationRepository,
   provider: TextGenerationProvider,
-  input: { sessionId: SessionId; text: string; runId?: string },
+  input: { sessionId: SessionId; text: string; runId?: string; modelSelection?: ModelSelectionSnapshot },
   agentOptions: AgentExecutionOptions = {},
 ): ReturnType<typeof executeTurn> {
   return executeTurn(repository, provider, input, agentOptions);
@@ -186,7 +200,7 @@ export interface AgentTurnStreamHandlers {
 export async function runAgentTurnStreaming(
   repository: ApplicationRepository,
   provider: TextGenerationProvider,
-  input: { sessionId: SessionId; text: string; runId?: string },
+  input: { sessionId: SessionId; text: string; runId?: string; modelSelection?: ModelSelectionSnapshot },
   handlers: AgentTurnStreamHandlers,
   agentOptions: AgentExecutionOptions = {},
 ): Promise<{ runId: string; userMessage: UserMessage; assistantMessage: AssistantMessage }> {

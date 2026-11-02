@@ -1,20 +1,21 @@
 # SMYS — NOW
 
-> Проверено 2026-11-02 после реализации SQLite completed-run traces, миграции JSON и восстановления Web истории по исходникам, тестам, ADR и независимому клиенту.
+> Проверено 2026-11-02 после Provider & Model Configuration (ADR-0017): исходники, SQLite migration/persistence, тесты и ручной browser прогон с LM Studio.
 
 ## Текущий фокус
 
-Live Inference UX и восстановление trajectory завершённых ходов реализованы. Следующий отдельный срез — active inference recovery, reconnect и event replay; они не входят в текущую реализацию.
+Live Inference UX, восстановление trajectory завершённых ходов и пользовательская конфигурация providers/models реализованы. Следующий отдельный срез — active inference recovery, reconnect и event replay; они не входят в текущую реализацию.
 
 ## Утверждённое направление и состояние
 
 - Стратегия SMYS и шесть направлений развития зафиксированы в [`PRODUCT.md`](./PRODUCT.md) и [`ROADMAP.md`](./ROADMAP.md).
-- **M1 — Unified Agent Execution:** общий Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Live reasoning event contract — [ADR-0013](./DECISIONS/ADR-0013-live-reasoning-deltas.md), безопасный Markdown Web — [ADR-0014](./DECISIONS/ADR-0014-safe-markdown-web.md). [ADR-0016](./DECISIONS/ADR-0016-sqlite-completed-runs.md) supersedes способ persistence из ADR-0015.
+- **M1 — Unified Agent Execution:** общий Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Live reasoning event contract — [ADR-0013](./DECISIONS/ADR-0013-live-reasoning-deltas.md), безопасный Markdown Web — [ADR-0014](./DECISIONS/ADR-0014-safe-markdown-web.md). [ADR-0016](./DECISIONS/ADR-0016-sqlite-completed-runs.md) supersedes способ persistence из ADR-0015; [ADR-0017](./DECISIONS/ADR-0017-provider-model-configuration.md) сохраняет completed-run модель ADR-0016 и повышает SQLite schema до v2.
 - LM Studio adapter вызывает необязательный `onReasoningDelta` при получении `reasoning_content`. Core публикует per-call `reasoning.delta`; существующий SSE передаёт его React до завершения model call. `reasoning.completed` остаётся canonical completion и обновляет блок, не дублируя текст.
 - React показывает в однострочном `Think` preview текущую логическую строку reasoning. Строка растёт по реальным дельтам и начинается заново после `\n`/`\r\n`; пустая активная строка показывает нейтральное `…`, а длинная — актуальный хвост с обрезанием слева. После завершения используется последняя непустая строка. Полный raw provider text сохраняется с исходными переносами и доступен по раскрытию; при отсутствии reasoning блок не создаётся. Первый `assistant.delta` завершает статус reasoning активного model call; `reasoning.completed` сверяет полный canonical text.
 - Web рендерит streaming и финальный assistant text через `react-markdown` + `remark-gfm`. Raw HTML не рендерится, небезопасные URL не становятся активными ссылками. Assistant `delta` остаётся потоковым.
 - Completed AgentRun отдельно хранит ordered model, per-call full reasoning и tool steps. Run связан с session, user message и assistant message стабильными IDs; финальный текст существует только в обычном assistant message. Application history API возвращает messages и runs одним ответом; React восстанавливает timeline по `assistantMessageId`. `reasoning.completed` сохраняется ровно один раз; `reasoning.delta` остаётся stream-only.
 - Web Host и CLI используют SQLite `store.sqlite`; завершение сохраняет assistant message и trace атомарно. JSON v1/v2/v3 импортируется один раз с exact-byte backup `store.json.vN.sqlite.bak`; legacy reasoning сохраняется, исторические traces не выдумываются. Файл SQLite создаётся с mode `0600`; reasoning и tool args/results хранятся локально без маскирования/шифрования и не попадают в логи. `sessionStorage` не используется.
+- **Provider & Model Configuration:** по [ADR-0017](./DECISIONS/ADR-0017-provider-model-configuration.md) Web UI управляет OpenAI-compatible providers, API key в текущем срезе хранится только в macOS Keychain, model IDs можно обнаружить или ввести вручную. Один Application resolver использует per-run → session → global selection, затем legacy env fallback; изменения применяются к следующему ходу без restart. Completed runs фиксируют provider/model snapshot. SQLite v1 мигрирует транзакционно в v2. Discovery оставляет capabilities `unknown`.
 
 ## Известные ограничения и открытые задачи
 
@@ -25,7 +26,7 @@ Live Inference UX и восстановление trajectory завершённ�
 ## Evidence
 
 - Код пути событий: `src/packages/core/agent/model.ts`, `src/packages/core/agent/events.ts`, `src/packages/core/agent/runtime.ts`, `src/packages/providers/lm-studio-provider.ts`, `src/packages/providers/fake-provider.ts`, `src/apps/web-host/server.ts`, `src/apps/web/src/api.ts`, `src/apps/web-ui/turn-presentation.ts`, `src/apps/web/src/App.tsx`.
-- Проверки: 76 root + 3 Web tests прошли; также прошли root build, typecheck, lint и Web production build. Suite проверяет SQLite reopen, импорт v1/v2/v3 и exact backups, атомарность completed-run записи, ordered tool/reasoning restore, Web Host restart и два независимых API clients.
+- Проверки: 85 root + 3 Web tests прошли; также прошли root build, typecheck, lint и Web production build. Suite проверяет SQLite reopen для конфигурации и run snapshots, v1 schema migration, импорт JSON v1/v2/v3 и exact backups, credential masking, model precedence/switching, CLI/Web общий store, атомарность completed-run записи, ordered tool/reasoning restore, Web Host restart и независимые API clients.
 - Ручная browser проверка: после завершённого run новый IAB tab открыл восстановленную Web Host сессию из SQLite и показал обе полные reasoning строки, `demo.add` между ними и один финальный assistant message. Это отдельный browser client, а не reload исходной вкладки.
 - Ручной прогон в браузере с реальной LM Studio, `qwen3.8-9b-mlx`: upstream `reasoning_content` появился до assistant `content`; React показал reasoning при пустом assistant draft. DOM polling выполнялся с периодом 250 мс; timestamps одного прогона, UTC:
 
@@ -41,6 +42,13 @@ Live Inference UX и восстановление trajectory завершённ�
   Между первыми DOM-наблюдениями reasoning и content — `15.707 s`; reasoning был виден до первого assistant content. Погрешность DOM timestamp ограничена интервалом polling до 250 мс. Раскрытый блок содержал 890 chars, `white-space: pre-wrap`, `overflow-y: auto`, высота содержимого была больше viewport блока.
 - Ручной прогон UI в браузере на Fake Provider с задержками и текстом из трёх строк (`\r\n`, пустая строка, `\n`): preview постепенно показывал первую строку, затем начинал отображать вторую и третью с начала. Блок оставался свёрнутым по умолчанию; раскрытый текст содержал 334 chars и исходные `\r\n`/пустую строку. После окончания строка перешла в `Анализ завершён` и показывала последнюю непустую строку.
 - Открытые направления и критерии: [`ROADMAP.md`](./ROADMAP.md), [`specs/001-unified-agent-execution.md`](./specs/001-unified-agent-execution.md), [`specs/002-live-inference-ui.md`](./specs/002-live-inference-ui.md).
+
+### Provider & Model Configuration — ручная проверка
+
+- Изолированный Web Host работал с отдельным временным `SMYS_DATA_DIR`; существующий host/store не использовался. В UI добавлен local provider `http://localhost:1234/v1`; до запуска server UI показал доступную для пользователя ошибку соединения.
+- Реальный LM Studio endpoint прошёл test и discovery: найдено 23 model IDs, capabilities всех discovered models остались `unknown`. Отдельный manual Model ID также добавлялся и выбирался через форму.
+- В одной сессии модель менялась с ручной на `liquid/lfm2.5-1.2b` без перезапуска host; два следующих хода вернули `OK.` и `READY.`. Чат сразу показал `Local LM Studio · liquid/lfm2.5-1.2b` у обоих завершённых ходов. Отдельный SQLite test закрывает и повторно открывает store, проверяя providers, model configs, session/global selections и run snapshot.
+- Изменения в рабочем `.env` не вносились. Временная тестовая конфигурация не является данными пользователя и удаляется после завершения ручной проверки.
 
 ## Следующий шаг
 
