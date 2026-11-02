@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import {
   runAgentTurn as generateAgentReply,
   AgentRuntimeError,
+  type AgentEvent,
   type TextGenerationProvider,
 } from "../core/agent";
-import type { AssistantMessage, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
+import type { AssistantMessage, AssistantReasoning, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import { InvalidArgumentError, SessionNotFoundError } from "./errors";
 import type { AgentExecutionOptions, SessionRepository } from "./ports";
 
@@ -76,20 +77,29 @@ export async function executeTurn(
   let userMessage: UserMessage;
   let assistantMessage: AssistantMessage;
   let reasoning: string | undefined;
+  const reasoningByCall: AssistantReasoning[] = [];
   agentOptions.signal?.throwIfAborted();
   try {
     userMessage = await sendMessage(repository, { sessionId: input.sessionId, text: input.text });
     await agentOptions.onEvent?.({ type: "turn.started", runId, userMessage });
     const history = await getHistory(repository, input.sessionId);
+    const onRuntimeEvent = async (event: AgentEvent): Promise<void> => {
+      if (event.type === "reasoning.completed") {
+        reasoningByCall.push({ callIndex: event.callIndex, text: event.text });
+      }
+      await agentOptions.onEvent?.(event);
+    };
     const result = await generateAgentReply(history.messages, provider, {
       sessionId: input.sessionId,
       ...agentOptions,
+      onEvent: onRuntimeEvent,
     });
     reasoning = result.reasoning;
     const savedAssistantMessage = await repository.appendAssistantMessage(input.sessionId, {
       id: randomUUID(),
       createdAt: new Date().toISOString(),
       text: result.text,
+      ...(reasoningByCall.length === 0 ? {} : { reasoning: reasoningByCall }),
     });
     if (savedAssistantMessage === null) {
       throw new SessionNotFoundError(input.sessionId);

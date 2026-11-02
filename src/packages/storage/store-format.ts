@@ -1,7 +1,8 @@
 import type { AssistantMessage, Message, Session, SessionHistory, UserMessage } from "../core/session";
 
-export const STORE_FORMAT_VERSION = 2;
+export const STORE_FORMAT_VERSION = 3;
 export const LEGACY_STORE_FORMAT_VERSION = 1;
+export const PREVIOUS_STORE_FORMAT_VERSION = 2;
 
 export interface StoreDocument {
   formatVersion: typeof STORE_FORMAT_VERSION;
@@ -10,10 +11,17 @@ export interface StoreDocument {
   [key: string]: unknown;
 }
 
-export interface LegacyStoreDocument {
+export interface LegacyV1StoreDocument {
   formatVersion: typeof LEGACY_STORE_FORMAT_VERSION;
   sessions: Session[];
   messages: UserMessage[];
+  [key: string]: unknown;
+}
+
+export interface LegacyV2StoreDocument {
+  formatVersion: typeof PREVIOUS_STORE_FORMAT_VERSION;
+  sessions: Session[];
+  messages: Message[];
   [key: string]: unknown;
 }
 
@@ -29,11 +37,24 @@ export function isStoreDocument(value: unknown): value is StoreDocument {
   return isStoreWithMessages(value, STORE_FORMAT_VERSION, isMessage);
 }
 
-export function isLegacyStoreDocument(value: unknown): value is LegacyStoreDocument {
+export function isLegacyStoreDocument(value: unknown): value is LegacyV1StoreDocument {
   return isStoreWithMessages(value, LEGACY_STORE_FORMAT_VERSION, isUserMessage);
 }
 
-export function migrateV1ToV2(store: LegacyStoreDocument): StoreDocument {
+export function isPreviousStoreDocument(value: unknown): value is LegacyV2StoreDocument {
+  return isStoreWithMessages(value, PREVIOUS_STORE_FORMAT_VERSION, isMessage);
+}
+
+export function migrateV1ToV3(store: LegacyV1StoreDocument): StoreDocument {
+  return {
+    ...store,
+    formatVersion: STORE_FORMAT_VERSION,
+    sessions: store.sessions,
+    messages: store.messages,
+  };
+}
+
+export function migrateV2ToV3(store: LegacyV2StoreDocument): StoreDocument {
   return {
     ...store,
     formatVersion: STORE_FORMAT_VERSION,
@@ -126,7 +147,29 @@ function isMessageForRole(value: unknown, role: "user" | "assistant"): value is 
     return false;
   }
   const content = candidate.content[0] as Record<string, unknown> | undefined;
-  return content?.type === "text" && typeof content.text === "string";
+  if (content?.type !== "text" || typeof content.text !== "string") return false;
+  if (role === "user" && candidate.reasoning !== undefined) return false;
+  if (role === "assistant" && candidate.reasoning !== undefined && !isAssistantReasoning(candidate.reasoning)) {
+    return false;
+  }
+  return true;
+}
+
+function isAssistantReasoning(value: unknown): value is NonNullable<AssistantMessage["reasoning"]> {
+  if (!Array.isArray(value)) return false;
+  let previousCallIndex = 0;
+  return value.every((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const candidate = entry as Record<string, unknown>;
+    if (
+      !Number.isInteger(candidate.callIndex) ||
+      (candidate.callIndex as number) <= previousCallIndex ||
+      typeof candidate.text !== "string" ||
+      candidate.text.length === 0
+    ) return false;
+    previousCallIndex = candidate.callIndex as number;
+    return true;
+  });
 }
 
 export function toHistory(session: Session, messages: Message[]): SessionHistory {

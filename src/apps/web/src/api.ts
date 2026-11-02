@@ -17,6 +17,7 @@ export interface SessionMessage {
   role: "user" | "assistant";
   content: [{ type: "text"; text: string }];
   createdAt: string;
+  reasoning?: { callIndex: number; text: string }[];
 }
 
 export interface SessionHistory {
@@ -240,7 +241,7 @@ function processStreamEvent(frame: string, handlers: AgentTurnStreamHandlers): P
       ...(typeof payload.reasoning === "string" ? { reasoning: payload.reasoning } : {}),
     };
   }
-  if (["model.started", "model.completed", "reasoning.completed", "tool.requested", "tool.started", "tool.completed"].includes(eventName)) {
+  if (["model.started", "model.completed", "reasoning.delta", "reasoning.completed", "tool.requested", "tool.started", "tool.completed"].includes(eventName)) {
     handlers.onRuntimeEvent?.(eventName, payload);
     return { type: "ignored" };
   }
@@ -248,10 +249,33 @@ function processStreamEvent(frame: string, handlers: AgentTurnStreamHandlers): P
 }
 
 function isSessionMessage(value: unknown): value is SessionMessage {
-  return isRecord(value) && typeof value.id === "string" && typeof value.sessionId === "string" &&
-    typeof value.sequence === "number" && (value.role === "user" || value.role === "assistant") &&
-    Array.isArray(value.content) && value.content.length === 1 && isRecord(value.content[0]) &&
-    value.content[0].type === "text" && typeof value.content[0].text === "string" && typeof value.createdAt === "string";
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.sessionId !== "string" ||
+    typeof value.sequence !== "number" ||
+    (value.role !== "user" && value.role !== "assistant") ||
+    !Array.isArray(value.content) ||
+    value.content.length !== 1 ||
+    !isRecord(value.content[0]) ||
+    value.content[0].type !== "text" ||
+    typeof value.content[0].text !== "string" ||
+    typeof value.createdAt !== "string"
+  ) {
+    return false;
+  }
+  return value.reasoning === undefined || (value.role === "assistant" && isAssistantReasoning(value.reasoning));
+}
+
+function isAssistantReasoning(value: unknown): value is NonNullable<SessionMessage["reasoning"]> {
+  if (!Array.isArray(value)) return false;
+  let previousCallIndex = 0;
+  return value.every((entry) => {
+    if (!isRecord(entry) || typeof entry.callIndex !== "number" || !Number.isInteger(entry.callIndex) || entry.callIndex <= previousCallIndex ||
+      typeof entry.text !== "string" || entry.text.length === 0) return false;
+    previousCallIndex = entry.callIndex;
+    return true;
+  });
 }
 
 function findEventBoundary(value: string): { index: number; length: number } | null {

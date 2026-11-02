@@ -159,6 +159,43 @@ test("LM Studio provider yields a token before the upstream stream completes", a
   assert.deepEqual(await generation, { kind: "final", text: "early" });
 });
 
+test("LM Studio provider forwards reasoning chunks in upstream order before content", async () => {
+  let releaseContent: (() => void) | undefined;
+  const contentGate = new Promise<void>((resolve) => { releaseContent = resolve; });
+  const provider = new LmStudioProvider({
+    endpoint,
+    model: "model-id",
+    fetcher: async () => new Response(new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"reasoning_content":"first "}}]}\n\n'));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"reasoning_content":"second"}}]}\n\n'));
+        await contentGate;
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+  });
+
+  const received: string[] = [];
+  let receivedBoth: (() => void) | undefined;
+  const bothReasoningChunks = new Promise<void>((resolve) => { receivedBoth = resolve; });
+  const generation = provider.generate(request, {
+    onReasoningDelta: (delta) => {
+      received.push(`reasoning:${delta}`);
+      if (received.filter((item) => item.startsWith("reasoning:")).length === 2) receivedBoth?.();
+    },
+    onTextDelta: (delta) => { received.push(`content:${delta}`); },
+  });
+
+  await bothReasoningChunks;
+  assert.deepEqual(received, ["reasoning:first ", "reasoning:second"]);
+  releaseContent?.();
+  assert.deepEqual(await generation, { kind: "final", text: "answer", reasoning: "first second" });
+  assert.deepEqual(received, ["reasoning:first ", "reasoning:second", "content:answer"]);
+});
+
 test("LM Studio provider rejects an interrupted SSE response without a done marker", async () => {
   const provider = new LmStudioProvider({
     endpoint,

@@ -15,24 +15,30 @@ import { StorageError } from "./errors";
 import {
   emptyStore,
   isLegacyStoreDocument,
+  isPreviousStoreDocument,
   isStoreDocument,
-  migrateV1ToV2,
+  migrateV1ToV3,
+  migrateV2ToV3,
   toHistory,
+  type LegacyV1StoreDocument,
+  type LegacyV2StoreDocument,
   type StoreDocument,
 } from "./store-format";
 
 type LoadedStore =
   | { store: StoreDocument; needsMigration: false }
-  | { store: StoreDocument; needsMigration: true; originalContents: Buffer };
+  | { store: StoreDocument; needsMigration: true; originalContents: Buffer; legacyVersion: 1 | 2 };
 
 export class JsonFileSessionRepository implements SessionRepository {
   private closed = false;
   private readonly storePath: string;
-  private readonly legacyBackupPath: string;
+  private readonly v1BackupPath: string;
+  private readonly v2BackupPath: string;
 
   constructor(dataDir: string) {
     this.storePath = join(dataDir, "store.json");
-    this.legacyBackupPath = join(dataDir, "store.json.v1.bak");
+    this.v1BackupPath = join(dataDir, "store.json.v1.bak");
+    this.v2BackupPath = join(dataDir, "store.json.v2.bak");
   }
 
   async createSession(session: Session): Promise<void> {
@@ -98,7 +104,13 @@ export class JsonFileSessionRepository implements SessionRepository {
     };
     const message: Message = role === "user"
       ? { ...common, role: "user" }
-      : { ...common, role: "assistant" };
+      : {
+        ...common,
+        role: "assistant",
+        ...(!("reasoning" in draft) || draft.reasoning === undefined || draft.reasoning.length === 0
+          ? {}
+          : { reasoning: draft.reasoning }),
+      };
     store.messages.push(message);
     await this.writeStore(store, loaded);
     return message;
@@ -118,11 +130,20 @@ export class JsonFileSessionRepository implements SessionRepository {
       if (isStoreDocument(parsed)) {
         return { store: parsed, needsMigration: false };
       }
-      if (isLegacyStoreDocument(parsed)) {
+      if (isPreviousStoreDocument(parsed)) {
         return {
-          store: migrateV1ToV2(parsed),
+          store: migrateV2ToV3(parsed as LegacyV2StoreDocument),
           needsMigration: true,
           originalContents,
+          legacyVersion: 2,
+        };
+      }
+      if (isLegacyStoreDocument(parsed)) {
+        return {
+          store: migrateV1ToV3(parsed as LegacyV1StoreDocument),
+          needsMigration: true,
+          originalContents,
+          legacyVersion: 1,
         };
       }
       throw new StorageError("The data file has an unsupported or invalid format.");
@@ -143,7 +164,7 @@ export class JsonFileSessionRepository implements SessionRepository {
     try {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       if (loaded.needsMigration) {
-        await this.preserveLegacyStore(loaded.originalContents);
+        await this.preserveLegacyStore(loaded.originalContents, loaded.legacyVersion);
       }
       await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, {
         encoding: "utf8",
@@ -160,23 +181,24 @@ export class JsonFileSessionRepository implements SessionRepository {
     }
   }
 
-  private async preserveLegacyStore(contents: Buffer): Promise<void> {
+  private async preserveLegacyStore(contents: Buffer, version: 1 | 2): Promise<void> {
+    const backupPath = version === 1 ? this.v1BackupPath : this.v2BackupPath;
     try {
-      await writeFile(this.legacyBackupPath, contents, { flag: "wx", mode: 0o600 });
+      await writeFile(backupPath, contents, { flag: "wx", mode: 0o600 });
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") {
-        throw new StorageError("Could not preserve the version 1 data file.", { cause: error });
+        throw new StorageError(`Could not preserve the version ${version} data file.`, { cause: error });
       }
       try {
-        const existingBackup = await readFile(this.legacyBackupPath);
+        const existingBackup = await readFile(backupPath);
         if (!existingBackup.equals(contents)) {
-          throw new StorageError("The existing version 1 backup differs from the data file.");
+          throw new StorageError(`The existing version ${version} backup differs from the data file.`);
         }
       } catch (backupError) {
         if (backupError instanceof StorageError) {
           throw backupError;
         }
-        throw new StorageError("Could not verify the existing version 1 backup.", { cause: backupError });
+        throw new StorageError(`Could not verify the existing version ${version} backup.`, { cause: backupError });
       }
     }
   }

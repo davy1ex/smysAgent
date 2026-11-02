@@ -15,10 +15,12 @@ export type ModelResponse =
   | { kind: "tool-call"; callId: string; name: string; arguments: unknown; reasoning?: string };
 
 export type ModelTextDeltaHandler = (text: string) => void | Promise<void>;
+export type ModelReasoningDeltaHandler = (text: string) => void | Promise<void>;
 
 export interface ModelGenerationOptions {
   signal?: AbortSignal;
   onTextDelta?: ModelTextDeltaHandler;
+  onReasoningDelta?: ModelReasoningDeltaHandler;
 }
 
 export interface TextGenerationProvider {

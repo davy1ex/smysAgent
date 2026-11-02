@@ -20,6 +20,11 @@ export interface UserMessage {
   createdAt: string;
 }
 
+export interface AssistantReasoning {
+  callIndex: number;
+  text: string;
+}
+
 export interface AssistantMessage {
   id: MessageId;
   sessionId: SessionId;
@@ -27,6 +32,7 @@ export interface AssistantMessage {
   role: "assistant";
   content: [TextContentPart];
   createdAt: string;
+  reasoning?: AssistantReasoning[];
 }
 
 export type Message = UserMessage | AssistantMessage;

@@ -2,67 +2,47 @@
 
 **UX-требования:** `Accepted` владельцем 2026-11-02.
 
-**Текущее поведение:** проверено по коду и automated tests на HEAD `b08bf82`; браузерная ручная проверка не проводилась.
+**Текущее поведение:** Stage A, Live Reasoning Streaming (Stage B), backend persistence reasoning завершённых ходов и безопасный Web Markdown `Implemented` по тестам; live streaming ранее проверен на LM Studio.
 
-**Новые технические контракты:** `Proposed` / открыты; этот spec не утверждает `reasoning.delta`, persistent runs, replay, resource locks или SQLite.
+**Технические решения:** контракты `reasoning.delta`, Web Markdown и persistence completed reasoning приняты в [ADR-0013](../DECISIONS/ADR-0013-live-reasoning-deltas.md), [ADR-0014](../DECISIONS/ADR-0014-safe-markdown-web.md) и [ADR-0015](../DECISIONS/ADR-0015-persist-completed-reasoning.md). Active run recovery, replay, resource locks и SQLite в этой задаче не входят.
 
 ## Цель
 
-Web показывает фактическое развитие agent turn в процессе исполнения. Клиент отображает состояние и события, полученные от backend, и не придумывает reasoning или статус завершения.
+Web показывает фактическое развитие agent turn во время исполнения. Клиент отображает события backend и не придумывает reasoning или статус завершения.
 
-## Реализовано сейчас
+## Реализовано
 
-- LM Studio provider в streaming mode передаёт assistant text chunks до конца upstream stream. Core публикует их как `assistant.delta`; Application сохраняет объединённый assistant message один раз после успешного завершения. Fake provider также выдаёт ответ частями.
-- Web SSE передаёт `turn.started`, model/tool events, `assistant.delta` и terminal turn event. React сразу создаёт временный пустой assistant draft, добавляет текстовые дельты, показывает курсор и текущий activity label.
-- UI начинает с пользовательского `pending` состояния и реагирует на реальные `model.started`/tool events, но сам run status хранится в локальном React state.
-- Provider может вернуть reasoning отдельно от ответа. Оно не хранится в JSON history.
+- LM Studio adapter вызывает необязательный provider callback `onReasoningDelta` для каждого непустого `reasoning_content` chunk при его поступлении. В том же frame reasoning передаётся раньше content; итоговый `ModelResponse.reasoning` сохраняется.
+- Core выдаёт `{ type: "reasoning.delta", callIndex, text }` через существующий `AgentEvent` handler в активном streaming model call. После успешного ответа сохраняется `reasoning.completed` с полным canonical text. Если reasoning уже streamed, UI обновляет существующий блок значением completion и не дописывает его повторно.
+- Web Host передаёт новое событие общим SSE callback; Web API его принимает. React создаёт свернутый reasoning block при первом реальном chunk, добавляет последующие chunks в нужный `callIndex`, показывает однострочный `Think` preview, сохраняет порядок model/tool calls и позволяет раскрыть полный текст над assistant message.
+- Provider, возвращающий reasoning только итоговым полем, создаёт block при получении этого поля. При отсутствии reasoning UI показывает только фактический нейтральный статус model call.
+- Fake Provider выдаёт delayed reasoning chunks до assistant content. Существующий `assistant.delta` не изменён; draft постепенно заменяется одним финальным сообщением после `turn.completed`.
+- Финальный и потоковый assistant text рендерятся `react-markdown` + `remark-gfm`. Raw HTML выключен, небезопасные URL schemes не становятся активными ссылками; безопасная обработка не использует `dangerouslySetInnerHTML` или raw HTML plugin.
+- При успешном завершении Application сохраняет per-call записи reasoning на assistant message. JSON store v3 мигрирует v1/v2 на первой записи с сохранением исходного файла в versioned backup; history API возвращает поле, а React восстанавливает свёрнутые блоки после reload. sessionStorage не используется.
+- Runtime events, partial reasoning ошибочных/отменённых ходов, UI draft и active inference не сохраняются и не восстанавливаются.
 
-Evidence: `src/packages/providers/lm-studio-provider.ts`, `src/packages/core/agent/runtime.ts`, `src/packages/application/use-cases.ts`, `src/apps/web-host/server.ts`, `src/apps/web/src/api.ts`, `src/apps/web/src/App.tsx`; тесты `LM Studio provider yields a token before the upstream stream completes`, `streaming Web API delivers deltas before model completion and persists once before completed` и `application emits ordered per-call reasoning and tool events around persistence`. `npm test`: 55 passed.
+## Evidence и проверки
 
-## Подтверждённые UX-проблемы и границы
+Изменения проверены в Core/Application, provider adapters, JSON storage, Web Host/API, `src/apps/web-ui/turn-presentation.ts` и Web UI; решение о completed reasoning persistence описано в ADR-0015.
 
-- **Reasoning не отображается live.** LM Studio накапливает `reasoning_content` в памяти provider, затем возвращает его вместе с итоговым `ModelResponse`. Core эмитит `reasoning.completed` после завершения `provider.generate()`. Web не обновляет reasoning по этому runtime event; после `turn.completed` React привязывает reasoning к сохранённому assistant message и показывает `<details>` под ответом. Значит, гипотеза из приложенной заметки о post-hoc блоке подтверждена; гипотеза об отсутствии text streaming опровергается кодом и тестами.
-- **Run не восстанавливается после reload/reopen.** При старте React загружает sessions/history; endpoint для получения активного run, snapshot и replay/subscription cursor отсутствуют. Pending/draft/reasoning состояния живут в React state и не сохраняются.
-- **Reload сейчас отменяет подключённую генерацию.** `AbortSignal` HTTP-запроса передаётся через Web host до provider. Web API test `disconnecting a streaming Web request aborts provider generation` подтверждает это поведение.
-- **Переключение чата в одной живой вкладке не равно восстановлению.** Текущий общий `pending` остаётся в React и активный SSE stream продолжает работать, но состояние скрыто, пока выбрана другая сессия; после возврата оно снова видно. Backend snapshot/reconnect нет.
-- **Защита от повторного запуска ограничена.** Один React App не принимает новую отправку при `sending`; один Web host ставит изменяющие запросы в последовательную очередь. Idempotency key/deduplication и общий lock между Web host и отдельным CLI process отсутствуют. Поэтому повторный запрос может выполниться позднее, а независимые процессы не координируются.
+- `npm test`: 67 root tests passed; Web Markdown suite: 3 passed.
+- `npm run typecheck`, `npm run lint` и `src/apps/web` `npm run build` прошли.
+- Тесты проверяют delayed provider chunks, upstream порядок reasoning/content, SSE per-call events, постепенное состояние UI, длинный текст, несколько model calls, reconciliation без дублей, whole-text reasoning fallback, отсутствие reasoning, persistence после повторного открытия JSON store, миграции v1/v2 → v3 и сохранение backup, history API, восстановление UI из истории, cancellation/error state, Markdown/GFM, incremental streaming, raw HTML и небезопасные ссылки.
+- Browser reload после этой persistence-правки вручную не проверен: канал управления браузером завершился с `Transport closed`. Повторное открытие JSON store и восстановление UI state отдельно покрыты storage, Web API и presentation тестами.
+- Ручной браузерный прогон с `qwen3.8-9b-mlx` подтвердил в одном ходе: `reasoning_content` `2026-11-02T07:32:11.346Z`; `reasoning.delta` SSE `07:32:11.347Z`; первый DOM render reasoning при пустом content `07:32:11.473Z`; первый upstream content `07:32:26.876Z`; `assistant.delta` SSE `07:32:26.885Z`; первый DOM render assistant content `07:32:27.180Z`. DOM polling interval — до 250 мс.
 
-## Требуемое поведение
+## Границы и открытые задачи
 
-1. Assistant answer появляется как draft во время active run и отображается постепенно по фактическим text deltas. Эта часть уже реализована в текущем Web path.
-2. Если provider выдаёт reasoning, UI показывает отдельный блок до финального ответа и обновляет его по мере поступления.
-3. Если provider reasoning не выдаёт, UI показывает только правдивый status вроде «Размышляет…» или «Генерирует ответ…»; reasoning не выдумывается.
-4. UI показывает фактический backend/run status, а не только локальное значение `sending`.
-5. После reload или повторного открытия сессии UI восстанавливает active run state и продолжает получать новые события, если run ещё выполняется.
-6. Повторное действие пользователя не должно незаметно создавать конкурирующий локальный inference. Политика отклонения, очереди или deduplication должна быть явной.
-7. После завершения сохраняется ровно один финальный assistant history message; временный draft не дублируется.
+- Completed reasoning сохраняется backend и доступен после Cmd+R. Reload во время active inference по-прежнему отменяет provider request при закрытии SSE; draft и активный ход не восстанавливаются. Для этого нужны отдельные backend status/snapshot/replay и reconnect contracts.
+- SQLite, durable trajectory, cross-process inference resource locks и второй agent loop не реализуются этим spec/патчем.
+- Аудит диагностических ошибок записан в [`NOW.md`](../NOW.md): `ECONNRESET` теряет исходную причину в provider catch и приходит в Web как generic `PROVIDER_ERROR`. Улучшение диагностики — отдельная задача.
 
-## Разделение дальнейшей работы
+## Принятые критерии Live Inference UX
 
-Это несколько независимых срезов, а не один implementation milestone:
-
-1. **Live reasoning display.** Сначала решить, как provider сообщает reasoning chunks, как Core/Application передают их Web host и как транспортирует SSE. Новый event/callback контракт требует ADR до реализации.
-2. **Active run reconciliation while host is alive.** Отдельно определить владельца run, status/snapshot API, подписку и cursor/replay semantics, cancel/disconnect semantics, idempotency и правила конкуренции между сессиями/клиентами. Это не только UI-задача.
-3. **Durable state and process restart.** Отдельно определить, какие status/events сохраняются, как run становится `interrupted` после потери backend и что восстанавливается. Реальная генерация не считается продолжающейся после перезапуска provider без доказательства. Выбор SQLite требует собственного принятого ADR.
-
-Текущий текстовый streaming не требует повторной реализации как отдельного milestone; его можно включить в проверку каждого будущего среза.
-
-## Критерии приёмки UX
-
-- Искусственно задержанный provider показывает assistant text до окончания ответа.
-- Provider с reasoning chunks показывает обновляющийся reasoning panel до финального ответа; provider без reasoning показывает status без сфабрикованного текста.
-- Финальный ответ появляется в history ровно один раз после `completed`.
-- Reload/reopen показывает server-authoritative активное состояние, а reconnect продолжает получать события без запуска второго provider call.
-- Потеря SSE-соединения не подменяется ложным `completed`/`failed`; эффект на run задаётся принятым контрактом.
-- Повторная отправка и запрос из независимого клиента/host следуют явной политике локального resource concurrency.
-
-## Открытые решения владельца
-
-- Какой provider/Core/Application event контракт нужен для live reasoning chunks; какие providers реально поддерживают их?
-- Должен ли disconnect отменять run или только подписку? Как пользователь явно отменяет run?
-- Где живёт авторитетный run registry и какие status/snapshot/replay API нужны?
-- Как гарантировать отсутствие незаметного повторного/параллельного локального inference между Web host и CLI: общий host, межпроцессная координация, очередь или конфликт?
-- Что переживает перезапуск Web host/provider и как обозначается неизвестное или прерванное состояние?
-- Нужна ли SQLite для долговременного хранения, или сначала достаточно другого принятого решения о persistence?
-
-До принятия необходимых ADR эти вопросы остаются `Proposed`; текущие контракты ADR-0012 продолжают действовать.
+1. Assistant content отображается по фактическим `assistant.delta` и сохраняется в истории один раз — `Implemented`.
+2. Если upstream отдаёт reasoning раньше content, первый chunk виден в UI до первого assistant content — `Implemented` и проверено на LM Studio.
+3. Все reasoning chunks доступны в раскрытом блоке, с переносами и прокруткой; отдельные model calls не смешиваются — `Implemented`.
+4. `reasoning.completed` завершает/сверяет тот же per-call block без дублей; отсутствие reasoning не создаёт вымышленный текст — `Implemented`.
+5. Финальный Markdown поддерживает GFM и потоковое обновление; raw HTML и unsafe URL не исполняются — `Implemented`.
+6. Ошибка/отмена не переводит ход в success и сохраняет уже полученный partial reasoning в состоянии завершения ошибки — `Implemented` по тестам.
+7. После завершённого хода history восстанавливает per-call reasoning после reload — `Implemented`, storage/Application/Web API/UI tests passed. Восстановление активного inference и replay/reconnect без дублей — `Planned`.

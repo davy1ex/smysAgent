@@ -26,7 +26,35 @@ test("file storage preserves a message after close and reopen", async (t) => {
   assert.deepEqual(history.messages, [savedMessage]);
 });
 
-test("v1 history reads without rewriting and first write preserves a backup during v2 migration", async (t) => {
+test("file storage preserves per-call assistant reasoning after close and reopen", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-storage-reasoning-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+
+  const firstRepository = new JsonFileSessionRepository(dataDir);
+  const session = await createSession(firstRepository);
+  await firstRepository.appendAssistantMessage(session.id, {
+    id: "assistant-with-reasoning",
+    createdAt: "2026-11-02T10:00:00.000Z",
+    text: "final reply",
+    reasoning: [
+      { callIndex: 1, text: "before tool" },
+      { callIndex: 2, text: "after tool" },
+    ],
+  });
+  await firstRepository.close();
+
+  const reopenedRepository = new JsonFileSessionRepository(dataDir);
+  const history = await getHistory(reopenedRepository, session.id);
+  await reopenedRepository.close();
+
+  const assistantMessage = history.messages.find((message) => message.role === "assistant");
+  assert.deepEqual(assistantMessage?.role === "assistant" ? assistantMessage.reasoning : undefined, [
+    { callIndex: 1, text: "before tool" },
+    { callIndex: 2, text: "after tool" },
+  ]);
+});
+
+test("v1 history reads without rewriting and first write preserves a backup during v3 migration", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-storage-v1-"));
   t.after(async () => rm(dataDir, { recursive: true, force: true }));
   const storePath = join(dataDir, "store.json");
@@ -70,12 +98,70 @@ test("v1 history reads without rewriting and first write preserves a backup duri
     sessions: Array<Record<string, unknown>>;
     messages: Array<Record<string, unknown>>;
   };
-  assert.equal(migrated.formatVersion, 2);
+  assert.equal(migrated.formatVersion, 3);
   assert.deepEqual(migrated.migrationNote, { keep: true });
   assert.equal(migrated.sessions[0]?.customSessionField, "keep");
   assert.equal(migrated.messages[0]?.customMessageField, "keep");
   assert.equal(migrated.messages[1]?.role, "assistant");
   assert.equal(migrated.messages[1]?.sequence, 2);
+});
+
+test("v2 history migrates to v3 on first write and preserves the original backup", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "smys-agent-storage-v2-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const storePath = join(dataDir, "store.json");
+  const backupPath = join(dataDir, "store.json.v2.bak");
+  const v2Store = {
+    formatVersion: 2,
+    note: "preserve unknown fields",
+    sessions: [{ id: "v2-session", createdAt: "2026-10-27T10:00:00.000Z" }],
+    messages: [
+      {
+        id: "v2-user",
+        sessionId: "v2-session",
+        sequence: 1,
+        role: "user",
+        content: [{ type: "text", text: "legacy user" }],
+        createdAt: "2026-10-27T10:01:00.000Z",
+      },
+      {
+        id: "v2-assistant",
+        sessionId: "v2-session",
+        sequence: 2,
+        role: "assistant",
+        content: [{ type: "text", text: "legacy assistant" }],
+        createdAt: "2026-10-27T10:02:00.000Z",
+      },
+    ],
+  };
+  const originalContents = Buffer.from(JSON.stringify(v2Store, null, 2) + "\n");
+  await writeFile(storePath, originalContents);
+
+  const readOnlyRepository = new JsonFileSessionRepository(dataDir);
+  const history = await getHistory(readOnlyRepository, "v2-session");
+  await readOnlyRepository.close();
+  assert.equal(history.messages[1]?.content[0]?.text, "legacy assistant");
+  assert.deepEqual(await readFile(storePath), originalContents);
+
+  const writingRepository = new JsonFileSessionRepository(dataDir);
+  await writingRepository.appendAssistantMessage("v2-session", {
+    id: "v3-assistant",
+    createdAt: "2026-10-27T10:03:00.000Z",
+    text: "new answer",
+    reasoning: [{ callIndex: 1, text: "new reasoning" }],
+  });
+  await writingRepository.close();
+
+  assert.deepEqual(await readFile(backupPath), originalContents);
+  const migrated = JSON.parse(await readFile(storePath, "utf8")) as {
+    formatVersion: number;
+    note: string;
+    messages: Array<Record<string, unknown>>;
+  };
+  assert.equal(migrated.formatVersion, 3);
+  assert.equal(migrated.note, "preserve unknown fields");
+  assert.deepEqual(migrated.messages[1]?.content, [{ type: "text", text: "legacy assistant" }]);
+  assert.deepEqual(migrated.messages[2]?.reasoning, [{ callIndex: 1, text: "new reasoning" }]);
 });
 
 test("unknown and malformed stores fail without changing the original file", async (t) => {
@@ -84,6 +170,7 @@ test("unknown and malformed stores fail without changing the original file", asy
   const storePath = join(dataDir, "store.json");
   const invalidContents = [
     Buffer.from('{"formatVersion":99,"sessions":[],"messages":[]}\n'),
+    Buffer.from('{"formatVersion":3,"sessions":[{"id":"session","createdAt":"2026-11-02T10:00:00.000Z"}],"messages":[{"id":"assistant","sessionId":"session","sequence":1,"role":"assistant","content":[{"type":"text","text":"answer"}],"createdAt":"2026-11-02T10:01:00.000Z","reasoning":[{"callIndex":1,"text":"first"},{"callIndex":1,"text":"duplicate call"}]}]}\n'),
     Buffer.from("not valid json\n"),
     Buffer.from([0x7b, 0xff, 0x7d]),
   ];

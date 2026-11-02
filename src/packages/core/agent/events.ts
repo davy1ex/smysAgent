@@ -3,6 +3,7 @@ import type { AssistantMessage, UserMessage } from "../session";
 export type AgentRuntimeEvent =
   | { type: "model.started"; callIndex: number }
   | { type: "model.completed"; callIndex: number }
+  | { type: "reasoning.delta"; callIndex: number; text: string }
   | { type: "reasoning.completed"; callIndex: number; text: string }
   | { type: "tool.requested"; callId: string; name: string; arguments: unknown }
   | { type: "tool.started"; callId: string; name: string }

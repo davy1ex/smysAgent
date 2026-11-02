@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
-    "test": "npm run build && node --test dist/src/tests/application/*.test.js dist/src/tests/storage/*.test.js dist/src/tests/providers/*.test.js dist/src/tests/cli/*.test.js dist/src/tests/web-host/*.test.js",
+    "test": "npm run build && node --test dist/src/tests/application/*.test.js dist/src/tests/storage/*.test.js dist/src/tests/providers/*.test.js dist/src/tests/cli/*.test.js dist/src/tests/web-host/*.test.js dist/src/tests/web/*.test.js && npm --prefix src/apps/web test",
     "precli": "npm run build",
     "cli": "node dist/src/apps/cli/main.js",
     "presmoke:lm-studio": "npm run build",

@@ -34,6 +34,14 @@ export class FakeProvider implements TextGenerationProvider {
   }
 
   private async emitText(response: ModelResponse, options: ModelGenerationOptions): Promise<void> {
+    if (response.reasoning !== undefined && options.onReasoningDelta !== undefined) {
+      for (let offset = 0; offset < response.reasoning.length; offset += 8) {
+        options.signal?.throwIfAborted();
+        if (offset > 0) await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        options.signal?.throwIfAborted();
+        await options.onReasoningDelta(response.reasoning.slice(offset, offset + 8));
+      }
+    }
     if (response.kind !== "final" || options.onTextDelta === undefined) return;
     for (let offset = 0; offset < response.text.length; offset += 8) {
       options.signal?.throwIfAborted();

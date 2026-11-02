@@ -46,6 +46,7 @@ export async function runAgentTurn(
     options.signal?.throwIfAborted();
     const callIndex = modelCall + 1;
     let streamedText = "";
+    let streamedReasoning = "";
     await emitEvent(options.onEvent, { type: "model.started", callIndex });
     const response = await provider.generate({
       messages: [...conversation],
@@ -53,6 +54,15 @@ export async function runAgentTurn(
     }, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.onTextDelta === undefined ? {} : {
+        onReasoningDelta: async (delta: string) => {
+          options.signal?.throwIfAborted();
+          if (typeof delta !== "string") {
+            throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid reasoning chunk.");
+          }
+          if (delta.length === 0) return;
+          streamedReasoning += delta;
+          await emitEvent(options.onEvent, { type: "reasoning.delta", callIndex, text: delta });
+        },
         onTextDelta: async (delta) => {
           options.signal?.throwIfAborted();
           if (typeof delta !== "string") {
@@ -67,7 +77,7 @@ export async function runAgentTurn(
     } satisfies ModelGenerationOptions);
     options.signal?.throwIfAborted();
 
-    await collectReasoning(response, reasoningParts, callIndex, options.onEvent);
+    await collectReasoning(response, streamedReasoning, reasoningParts, callIndex, options.onEvent);
     if (response.kind === "final") {
       const result = createTurnResult(response, reasoningParts);
       if (streamedText.length > 0 && streamedText !== result.text) {
@@ -152,6 +162,7 @@ function createModelConversation(messages: readonly Message[]): ModelMessage[] {
 
 async function collectReasoning(
   response: ModelResponse,
+  streamedReasoning: string,
   reasoningParts: string[],
   callIndex: number,
   onEvent: AgentEventHandler | undefined,
@@ -159,18 +170,17 @@ async function collectReasoning(
   if (typeof response !== "object" || response === null) {
     throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned an invalid response.");
   }
-  if (response.reasoning !== undefined) {
-    if (typeof response.reasoning !== "string") {
-      throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned invalid reasoning.");
-    }
-    if (response.reasoning.length > 0) {
-      reasoningParts.push(response.reasoning);
-      await emitEvent(onEvent, {
-        type: "reasoning.completed",
-        callIndex,
-        text: response.reasoning,
-      });
-    }
+  if (response.reasoning !== undefined && typeof response.reasoning !== "string") {
+    throw new AgentRuntimeError("INVALID_MODEL_RESPONSE", "The model provider returned invalid reasoning.");
+  }
+  const reasoning = response.reasoning ?? streamedReasoning;
+  if (reasoning.length > 0) {
+    reasoningParts.push(reasoning);
+    await emitEvent(onEvent, {
+      type: "reasoning.completed",
+      callIndex,
+      text: reasoning,
+    });
   }
 }
 

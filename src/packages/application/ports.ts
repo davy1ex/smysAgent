@@ -1,4 +1,4 @@
-import type { AssistantMessage, MessageId, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
+import type { AssistantMessage, AssistantReasoning, MessageId, Session, SessionHistory, SessionId, UserMessage } from "../core/session";
 import type { AgentEventHandler, AgentTool, ToolPermissionPolicy } from "../core/agent";
 
 export interface AgentExecutionOptions {
@@ -19,6 +19,7 @@ export interface AssistantMessageDraft {
   id: MessageId;
   createdAt: string;
   text: string;
+  reasoning?: AssistantReasoning[];
 }
 
 export interface SessionRepository {

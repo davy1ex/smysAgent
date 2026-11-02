@@ -47,7 +47,7 @@ class MemorySessionRepository implements SessionRepository {
 
   async appendAssistantMessage(
     sessionId: SessionId,
-    draft: { id: string; createdAt: string; text: string },
+    draft: { id: string; createdAt: string; text: string; reasoning?: { callIndex: number; text: string }[] },
   ): Promise<AssistantMessage | null> {
     if (!this.sessions.has(sessionId)) {
       return null;
@@ -60,6 +60,7 @@ class MemorySessionRepository implements SessionRepository {
       role: "assistant",
       content: [{ type: "text", text: draft.text }],
       createdAt: draft.createdAt,
+      ...(draft.reasoning === undefined ? {} : { reasoning: draft.reasoning }),
     };
     this.messages.push(message);
     return message;
@@ -149,10 +150,15 @@ test("application streaming turn forwards deltas and persists their final text o
   const chunks: string[] = [];
   const events: AgentEvent[] = [];
   const provider = {
-    async generate(_request: unknown, options?: { onTextDelta?: (text: string) => void | Promise<void> }) {
+    async generate(_request: unknown, options?: {
+      onTextDelta?: (text: string) => void | Promise<void>;
+      onReasoningDelta?: (text: string) => void | Promise<void>;
+    }) {
+      await options?.onReasoningDelta?.("reasoning ");
+      await options?.onReasoningDelta?.("arrived first");
       await options?.onTextDelta?.("streamed ");
       await options?.onTextDelta?.("reply");
-      return { kind: "final" as const, text: "streamed reply" };
+      return { kind: "final" as const, text: "streamed reply", reasoning: "reasoning arrived first" };
     },
   };
   let startedUser: UserMessage | undefined;
@@ -172,17 +178,63 @@ test("application streaming turn forwards deltas and persists their final text o
   assert.deepEqual(events.map((event) => event.type), [
     "turn.started",
     "model.started",
+    "reasoning.delta",
+    "reasoning.delta",
     "assistant.delta",
     "assistant.delta",
+    "reasoning.completed",
     "model.completed",
     "turn.completed",
   ]);
+  assert.deepEqual(events.filter((event) => event.type === "reasoning.delta").map((event) => event.type === "reasoning.delta" && [event.callIndex, event.text]), [
+    [1, "reasoning "],
+    [1, "arrived first"],
+  ]);
+  const completedReasoning = events.find((event) => event.type === "reasoning.completed");
+  assert.deepEqual(completedReasoning, { type: "reasoning.completed", callIndex: 1, text: "reasoning arrived first" });
   assert.equal(startedUser?.id, turn.userMessage.id);
   assert.equal(turn.assistantMessage.content[0]?.text, "streamed reply");
   assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
     ["user", "hello"],
     ["assistant", "streamed reply"],
   ]);
+  assert.deepEqual(history.messages[1]?.role === "assistant" ? history.messages[1].reasoning : undefined, [
+    { callIndex: 1, text: "reasoning arrived first" },
+  ]);
+});
+
+test("application emits whole-text reasoning only when a provider returns it", async () => {
+  const repository = new MemorySessionRepository();
+  const session = await createSession(repository);
+  const events: AgentEvent[] = [];
+  const provider = {
+    async generate(_request: unknown, options?: { onTextDelta?: (text: string) => void | Promise<void> }) {
+      await options?.onTextDelta?.("answer");
+      return { kind: "final" as const, text: "answer", reasoning: "whole-text reasoning" };
+    },
+  };
+
+  await runAgentTurnStreaming(
+    repository,
+    provider,
+    { sessionId: session.id, text: "hello" },
+    { onStarted() {}, onTextDelta() {} },
+    { onEvent(event) { events.push(event); } },
+  );
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "turn.started",
+    "model.started",
+    "assistant.delta",
+    "reasoning.completed",
+    "model.completed",
+    "turn.completed",
+  ]);
+  assert.deepEqual(events.find((event) => event.type === "reasoning.completed"), {
+    type: "reasoning.completed",
+    callIndex: 1,
+    text: "whole-text reasoning",
+  });
 });
 
 test("application streaming cancellation leaves the user message without a false assistant completion", async () => {
@@ -190,11 +242,15 @@ test("application streaming cancellation leaves the user message without a false
   const session = await createSession(repository);
   const controller = new AbortController();
   const provider = {
-    async generate(_request: unknown, options?: { onTextDelta?: (text: string) => void | Promise<void>; signal?: AbortSignal }) {
-      await options?.onTextDelta?.("partial");
+    async generate(_request: unknown, options?: {
+      onTextDelta?: (text: string) => void | Promise<void>;
+      onReasoningDelta?: (text: string) => void | Promise<void>;
+      signal?: AbortSignal;
+    }) {
+      await options?.onReasoningDelta?.("partial reasoning");
       options?.signal?.throwIfAborted();
       await options?.onTextDelta?.("unreachable");
-      return { kind: "final" as const, text: "partialunreachable" };
+      return { kind: "final" as const, text: "unreachable", reasoning: "partial reasoning" };
     },
   };
 
@@ -206,8 +262,9 @@ test("application streaming cancellation leaves the user message without a false
       {
         signal: controller.signal,
         onStarted() {},
-        onTextDelta() { controller.abort(); },
+        onTextDelta() {},
       },
+      { onEvent(event) { if (event.type === "reasoning.delta") controller.abort(); } },
     ),
     (error: unknown) => error instanceof DOMException && error.name === "AbortError",
   );
@@ -342,12 +399,24 @@ test("application emits ordered per-call reasoning and tool events around persis
         if (event.type === "turn.completed") {
           const history = await getHistory(repository, session.id);
           assert.equal(history.messages.at(-1)?.role, "assistant");
+          const assistant = history.messages.at(-1);
+          assert.deepEqual(
+            assistant?.role === "assistant" ? assistant.reasoning : undefined,
+            [
+              { callIndex: 1, text: "Prepare the tool call." },
+              { callIndex: 2, text: "Use the tool result." },
+            ],
+          );
         }
       },
     },
   );
 
   assert.equal(turn.reasoning, "Prepare the tool call.\n\nUse the tool result.");
+  assert.deepEqual(turn.assistantMessage.reasoning, [
+    { callIndex: 1, text: "Prepare the tool call." },
+    { callIndex: 2, text: "Use the tool result." },
+  ]);
   assert.deepEqual(events, [
     { type: "turn.started", runId: "run-1", userMessage: turn.userMessage },
     { type: "model.started", callIndex: 1 },

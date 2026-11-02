@@ -22,6 +22,9 @@ AI может исследовать варианты, подготовить п
 - [ADR-0010: End-to-end text streaming](ADR-0010-end-to-end-text-streaming.md) — superseded by ADR-0012; исходное решение о раздельном streaming пути.
 - [ADR-0011: Внутренний контракт событий хода агента](ADR-0011-agent-event-contract.md) — расширен ADR-0012; общий внутренний порядок model/tool/reasoning и turn events.
 - [ADR-0012: Единое исполнение хода агента](ADR-0012-unified-agent-execution.md) — один Application lifecycle и Core loop для text streaming, tool calls, reasoning и отмены; host адаптируют вывод и разрешённые capabilities.
+- [ADR-0013: Потоковая передача reasoning deltas](ADR-0013-live-reasoning-deltas.md) — необязательный provider callback и per-model-call `reasoning.delta` event через существующий Core/Event/SSE путь; `reasoning.completed` остаётся canonical завершением блока.
+- [ADR-0014: Безопасный Markdown в Web ответах](ADR-0014-safe-markdown-web.md) — Web UI рендерит assistant streaming/final content через `react-markdown` и `remark-gfm`, не включая raw HTML.
+- [ADR-0015: Сохранение reasoning завершённых ходов](ADR-0015-persist-completed-reasoning.md) — assistant history хранит per-call reasoning в JSON store v3; v1/v2 мигрируют с versioned backup, active inference recovery не входит.
 
 ## Шаблон
 

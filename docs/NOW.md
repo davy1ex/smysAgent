@@ -1,32 +1,44 @@
 # SMYS — NOW
 
-> Проверено 2026-11-02 на исходном HEAD `b08bf82` по коду, тестам и ADR. Этот файл описывает текущее состояние, но не заменяет принятые технические решения.
+> Проверено 2026-11-02 после backend persistence завершённых reasoning по исходникам, тестам, ADR и ручному прогону Live Reasoning на LM Studio.
 
 ## Текущий фокус
 
-Уточнить отдельные вертикальные срезы для live-inference UI по [`specs/002-live-inference-ui.md`](./specs/002-live-inference-ui.md). Требования UX утверждены владельцем; новые provider/event/API/storage контракты и реализация пока не утверждены.
+Live Inference UX и backend persistence reasoning завершённых ходов реализованы. Следующий отдельный срез — восстановление активного inference, durable run state и event replay; они не входят в текущую реализацию.
 
 ## Утверждённое направление и состояние
 
 - Стратегия SMYS и шесть направлений развития зафиксированы в [`PRODUCT.md`](./PRODUCT.md) и [`ROADMAP.md`](./ROADMAP.md).
-- **M1 — Unified Agent Execution:** направление принято, единый Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Полный `npm test` прошёл: 55 тестов, 0 ошибок. Ручная проверка React UI не проводилась, поэтому milestone не помечен как полностью validated.
-- Web передаёт реальные runtime/lifecycle SSE events и показывает assistant text deltas по мере поступления. Web создаёт временный пустой assistant draft, затем пополняет его дельтами.
-- LM Studio adapter собирает provider reasoning в ходе stream, но не передаёт его по дельтам. Runtime выдаёт `reasoning.completed` только после возврата provider; Web сохраняет reasoning в состоянии React после `turn.completed` и показывает его в раскрываемом блоке у готового ответа.
-- История JSON store содержит user/assistant messages. Run state, reasoning, runtime events и partial answer не сохраняются.
+- **M1 — Unified Agent Execution:** общий Application lifecycle и Core loop реализованы по [ADR-0012](./DECISIONS/ADR-0012-unified-agent-execution.md). Live reasoning event contract — [ADR-0013](./DECISIONS/ADR-0013-live-reasoning-deltas.md), безопасный Markdown Web — [ADR-0014](./DECISIONS/ADR-0014-safe-markdown-web.md), persistence reasoning завершённых ходов — [ADR-0015](./DECISIONS/ADR-0015-persist-completed-reasoning.md).
+- LM Studio adapter вызывает необязательный `onReasoningDelta` при получении `reasoning_content`. Core публикует per-call `reasoning.delta`; существующий SSE передаёт его React до завершения model call. `reasoning.completed` остаётся canonical completion и обновляет блок, не дублируя текст.
+- React показывает однострочный `Think` preview в свернутом блоке над ответом; полный raw provider text остаётся доступен по явному раскрытию. Provider, возвращающий reasoning только целиком, создаёт preview при получении полного значения; при отсутствии reasoning блок не создаётся. Fake Provider задерживает отдельные reasoning chunks до content.
+- Web рендерит streaming и финальный assistant text через `react-markdown` + `remark-gfm`. Raw HTML не рендерится, небезопасные URL не становятся активными ссылками. Assistant `delta` остаётся потоковым.
+- Assistant message сохраняет необязательные per-call reasoning записи с callIndex и text для каждого завершённого model call. JSON store v3 мигрирует v1/v2 при первой записи и сохраняет исходный формат в versioned backup. History API возвращает reasoning внутри assistant message, React восстанавливает свёрнутые блоки после reload. sessionStorage не используется.
 
-## Подтверждённые пробелы
+## Известные ограничения и открытые задачи
 
-- Live reasoning до/во время генерации отсутствует; вместо него при начале model call показывается общий activity status.
-- При первом открытии страницы Web загружает sessions/history, но не запрашивает состояние активного run и не восстанавливает подписку. Обновление страницы закрывает SSE stream; Host передаёт его `AbortSignal` provider, поэтому текущая генерация отменяется.
-- Переключение чата в том же смонтированном UI скрывает общий локальный pending turn, но не закрывает текущий stream; после возврата состояние снова видно. Snapshot/status API и повторной подписки нет.
-- Один экземпляр Web UI блокирует повторную отправку локальным `sending`; Web host последовательно выполняет изменяющие запросы в одном процессе. Это не даёт idempotency и не координирует Web host с отдельным CLI-процессом.
+- После Cmd+R completed reasoning восстанавливается из backend history. Незавершённый UI draft и active inference не восстанавливаются: закрытие SSE передаёт cancellation provider.
+- Нет durable active run state, event replay/reconnect, SQLite или межпроцессной inference resource lock. Это отдельные решения направления Persistent Runs / Trajectory.
+- Аудит ошибок: `ECONNRESET` из `fetch` попадает в общий catch `src/packages/providers/lm-studio-provider.ts` и преобразуется в `LmStudioProviderError("Could not connect to LM Studio.")` без исходной ошибки/cause; Web Host классифицирует её как `PROVIDER_ERROR`, поэтому код `ECONNRESET` теряется. Отдельный fallback Host `An unexpected error occurred.` в `toApiFailure()` применяется к нераспознанным исключениям и также не раскрывает тип/cause; это generic error path, а не сообщение нормализованного `ECONNRESET`. Улучшение диагностики оставлено отдельной задачей.
 
 ## Evidence
 
-- Core/Application/Host/Web: `src/packages/core/agent/runtime.ts`, `src/packages/core/agent/events.ts`, `src/packages/providers/lm-studio-provider.ts`, `src/packages/application/use-cases.ts`, `src/apps/web-host/server.ts`, `src/apps/web/src/api.ts`, `src/apps/web/src/App.tsx`.
-- Проверки: `npm test` — 55 passed. В частности, тесты покрывают streaming текста до окончания provider stream, порядок reasoning event после provider response, сохранение финального ответа один раз и отмену provider при разрыве Web stream. React rendering отдельными тестами не покрыт.
-- Прогресс шести направлений и открытые технические решения: [`ROADMAP.md`](./ROADMAP.md), [`specs/001-unified-agent-execution.md`](./specs/001-unified-agent-execution.md), [`specs/002-live-inference-ui.md`](./specs/002-live-inference-ui.md).
+- Код пути событий: `src/packages/core/agent/model.ts`, `src/packages/core/agent/events.ts`, `src/packages/core/agent/runtime.ts`, `src/packages/providers/lm-studio-provider.ts`, `src/packages/providers/fake-provider.ts`, `src/apps/web-host/server.ts`, `src/apps/web/src/api.ts`, `src/apps/web-ui/turn-presentation.ts`, `src/apps/web/src/App.tsx`.
+- Проверки: npm test — 67 root tests + 3 Web Markdown tests passed; npm run typecheck, npm run lint и Web build прошли. Добавлены проверки persistence per-call reasoning, migration v1/v2 → v3, backup исходного store, Web history response и восстановления UI в порядке callIndex. Существующие проверки покрывают delayed Fake chunks, LM Studio upstream order, SSE, cancellation/failure и безопасный Markdown.
+- Ручной прогон в браузере с реальной LM Studio, `qwen3.8-9b-mlx`: upstream `reasoning_content` появился до assistant `content`; React показал reasoning при пустом assistant draft. DOM polling выполнялся с периодом 250 мс; timestamps одного прогона, UTC:
+
+  | Участок | Событие | Timestamp |
+  | --- | --- | --- |
+  | LM Studio → provider | первый `reasoning_content` delta, 8 chars | `2026-11-02T07:32:11.346Z` |
+  | Core → SSE | первый `reasoning.delta`, `callIndex=1` | `2026-11-02T07:32:11.347Z` |
+  | React DOM | первый reasoning виден, assistant content = 0 | `2026-11-02T07:32:11.473Z` |
+  | LM Studio → provider | первый `content` delta, 2 chars | `2026-11-02T07:32:26.876Z` |
+  | Core → SSE | первый `assistant.delta` | `2026-11-02T07:32:26.885Z` |
+  | React DOM | первый assistant content виден | `2026-11-02T07:32:27.180Z` |
+
+  Между первыми DOM-наблюдениями reasoning и content — `15.707 s`; reasoning был виден до первого assistant content. Погрешность DOM timestamp ограничена интервалом polling до 250 мс. Раскрытый блок содержал 890 chars, `white-space: pre-wrap`, `overflow-y: auto`, высота содержимого была больше viewport блока.
+- Открытые направления и критерии: [`ROADMAP.md`](./ROADMAP.md), [`specs/001-unified-agent-execution.md`](./specs/001-unified-agent-execution.md), [`specs/002-live-inference-ui.md`](./specs/002-live-inference-ui.md).
 
 ## Следующий шаг
 
-Владелец выбирает и утверждает отдельное архитектурное решение для live reasoning и восстановления/координации run. После этого можно определить один небольшой implementation slice и его проверяемый критерий. Документационное слияние не является разрешением начать эту реализацию.
+Спроектировать восстановление active run и replay отдельным ADR до изменения lifecycle/transport. Диагностику ECONNRESET также вести отдельной задачей. Ручная browser проверка reload после этой миграции не выполнена: CUA browser transport был закрыт; persistence покрыта storage/application/Web API тестами.

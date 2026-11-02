@@ -1,5 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Icon } from "./components/Icon";
+import { AssistantMarkdown } from "../markdown-renderer.mjs";
+import {
+  applyTurnRuntimeEvent,
+  completeTurn,
+  createTurnPresentation,
+  failTurn,
+  markAssistantDelta,
+  restoreCompletedReasoning,
+  type TurnPresentation,
+  type TurnStep,
+} from "../../web-ui/turn-presentation";
 import {
   createSession,
   fetchHistory,
@@ -14,8 +25,7 @@ import {
 
 const mobileBreakpoint = "(max-width: 760px)";
 
-type TurnStatus = "pending" | "completed" | "error" | "cancelled";
-type PendingTurn = { sessionId: string; id: string; text: string; assistantText: string; createdAt: string; activity?: string };
+type PendingTurn = { sessionId: string; id: string; text: string; assistantText: string; createdAt: string };
 
 function formatTime(value: string): string {
   const date = new Date(value);
@@ -33,32 +43,21 @@ function formatSessionDate(value: string): string {
 
 function MessageItem({
   message,
-  turnStatus,
-  turnError,
   streaming = false,
   compact = false,
   stepNumber,
-  reasoning,
-  activity,
+  presentation,
+  detailedTimeline = false,
 }: {
   message: SessionMessage;
-  turnStatus?: TurnStatus | undefined;
-  turnError?: string | undefined;
   streaming?: boolean;
   compact?: boolean;
   stepNumber?: number;
-  reasoning?: string | undefined;
-  activity?: string | undefined;
+  presentation?: TurnPresentation | undefined;
+  detailedTimeline?: boolean;
 }) {
   const isUser = message.role === "user";
-  const statusIcon = turnStatus === "pending" ? "loader" : turnStatus === "error" || turnStatus === "cancelled" ? "alert" : "check";
-  const statusLabel = turnStatus === "pending"
-    ? "Генерируется ответ…"
-    : turnStatus === "error"
-      ? turnError ?? "Ошибка ответа"
-      : turnStatus === "cancelled"
-        ? "Генерация остановлена"
-      : "Ответ получен";
+  const timelinePresentation = presentation ?? (isUser ? undefined : restoreCompletedReasoning(message.reasoning));
 
   return (
     <article className={`message-item ${isUser ? "message-user" : "message-assistant"}${compact ? " message-compact" : ""}`}>
@@ -69,27 +68,205 @@ function MessageItem({
           <strong>{isUser ? "Вы" : "smys"}</strong>
           <time dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>
         </div>
-        <p className={streaming && message.content[0]?.text.length === 0 ? "streaming-placeholder" : undefined}>
-          {message.content[0]?.text || (streaming ? "Генерируется ответ…" : "")}
-          {streaming && message.content[0]?.text.length > 0 && <span className="streaming-cursor" aria-hidden="true">▍</span>}
-        </p>
-        {activity && !isUser && <small className="turn-activity">{activity}</small>}
-        {reasoning && !isUser && (
-          <details className="turn-reasoning">
-            <summary>Рассуждение модели</summary>
-            <p>{reasoning}</p>
-          </details>
-        )}
-        {isUser && turnStatus && (
-          <div className={`turn-status turn-${turnStatus}`} role={turnStatus === "error" ? "alert" : "status"}>
-            <Icon name={statusIcon} size={12} />
-            <span>{statusLabel}</span>
-          </div>
-        )}
+        {!isUser && timelinePresentation && <TurnTimeline presentation={timelinePresentation} detailed={detailedTimeline} />}
+        {isUser
+          ? <p>{message.content[0]?.text}</p>
+          : <div className={`assistant-markdown${streaming && message.content[0]?.text.length === 0 ? " streaming-placeholder" : ""}`}>
+            {message.content[0]?.text
+              ? <AssistantMarkdown content={message.content[0].text} />
+              : streaming && <p className="streaming-placeholder">Генерируется ответ…</p>}
+            {streaming && message.content[0]?.text.length > 0 && <span className="streaming-cursor" aria-hidden="true">▍</span>}
+          </div>}
       </div>
       {isUser && <span className="user-avatar">D</span>}
     </article>
   );
+}
+
+function TurnTimeline({
+  presentation,
+  detailed = false,
+}: {
+  presentation: TurnPresentation;
+  detailed?: boolean;
+}) {
+  const icon = presentation.status === "completed"
+    ? "check"
+    : presentation.status === "failed" || presentation.status === "cancelled"
+      ? "alert"
+      : "loader";
+  const statusLabel = turnStatusLabel(presentation);
+
+  return (
+    <section className={`turn-timeline${detailed ? " turn-timeline-detailed" : " turn-timeline-compact"}`} aria-label="Ход агента">
+      <div className={`turn-status turn-${presentation.status}`} role={presentation.status === "failed" ? "alert" : "status"}>
+        <Icon name={icon} size={12} />
+        <span>{statusLabel}</span>
+      </div>
+      {presentation.steps.length > 0 && (
+        <ol className="turn-steps">
+          {presentation.steps
+            .filter((step) => detailed || step.type !== "model")
+            .map((step, index) => (
+            <li className={`turn-step-row turn-step-${step.type}`} key={turnStepKey(step, index)}>
+              <TurnStepView step={step} presentation={presentation} detailed={detailed} />
+            </li>
+            ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+function TurnStepView({
+  step,
+  presentation,
+  detailed,
+}: {
+  step: TurnStep;
+  presentation: TurnPresentation;
+  detailed: boolean;
+}) {
+  if (step.type === "model") {
+    const label = step.status === "running"
+      ? step.phase === "generating" ? "Генерирует ответ…" : "Модель выполняет запрос…"
+      : step.status === "completed"
+        ? "Вызов модели завершён"
+        : step.status === "cancelled"
+          ? "Вызов модели отменён"
+          : step.status === "failed"
+            ? "Ошибка вызова модели"
+            : "Ожидание модели…";
+    const modelStepContent = (
+      <>
+        <Icon name={step.status === "running" ? "loader" : step.status === "completed" ? "check" : "alert"} size={12} />
+        <span>{label}</span>
+        <small>#{step.callIndex}</small>
+      </>
+    );
+    return detailed
+      ? <details className={`turn-model-step turn-step-state-${step.status}`}>
+        <summary>{modelStepContent}</summary>
+        <div className="turn-model-details">
+          <span>Вызов модели #{step.callIndex}</span>
+          <span>Состояние: {label}</span>
+          <span>Фаза: {step.phase === "generating" ? "генерация текста" : "ожидание ответа"}</span>
+        </div>
+      </details>
+      : <div className={`turn-model-step turn-step-state-${step.status}`}>{modelStepContent}</div>;
+  }
+
+  if (step.type === "reasoning") {
+    return <ReasoningStepView step={step} detailed={detailed} />;
+  }
+
+  const toolStatus = step.status === "completed"
+    ? "Завершён"
+    : step.status === "running"
+      ? "Выполняется"
+      : step.status === "failed"
+        ? "Ошибка"
+        : step.status === "cancelled"
+          ? "Отменён"
+          : "Запрошен";
+  return (
+    <details className={`turn-tool-step turn-step-state-${step.status}`}>
+      <summary>
+        <span>{step.name}</span>
+        <small>{toolStatus}</small>
+      </summary>
+      <div className="turn-tool-details">
+        {detailed && <>
+          <strong>Аргументы</strong>
+          <pre>{formatJson(step.arguments)}</pre>
+        </>}
+        {step.result !== undefined && <>
+          <strong>Результат</strong>
+          <pre>{step.result}</pre>
+        </>}
+        {step.status === "failed" && presentation.error && <p role="alert">{presentation.error}</p>}
+        {step.status === "cancelled" && presentation.error && <p>{presentation.error}</p>}
+      </div>
+    </details>
+  );
+}
+
+function ReasoningStepView({ step, detailed }: { step: Extract<TurnStep, { type: "reasoning" }>; detailed: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = step.status === "completed" ? "Анализ завершён"
+    : step.status === "failed" ? "Анализ прерван из-за ошибки"
+      : step.status === "cancelled" ? "Анализ остановлен"
+        : "Анализирует…";
+
+  return (
+    <details
+      className={`turn-reasoning turn-reasoning-${step.status}`}
+      open={expanded}
+      onToggle={(event) => {
+        const next = event.currentTarget.open;
+        setExpanded((current) => current === next ? current : next);
+      }}
+    >
+      <summary>
+        <strong>{detailed ? `Размышление модели · вызов #${step.callIndex}` : label}</strong>
+        {!detailed && <span className="turn-reasoning-preview"><b>Think</b> · {step.text}</span>}
+      </summary>
+      <p className="turn-reasoning-text">{step.text}</p>
+    </details>
+  );
+}
+
+function turnStatusLabel(presentation: TurnPresentation): string {
+  switch (presentation.status) {
+    case "connecting": return "Отправляем запрос…";
+    case "running": {
+      const active = [...presentation.steps].reverse().find((step) =>
+        (step.type === "model" || step.type === "tool") && (step.status === "pending" || step.status === "running"),
+      );
+      if (active?.type === "tool") return `Выполняется ${active.name}…`;
+      if (active?.type === "model") {
+        return active.phase === "generating" ? "Генерирует ответ…" : "Модель выполняет запрос…";
+      }
+      return "Модель выполняет запрос…";
+    }
+    case "completed":
+      return presentation.durationMs === undefined
+        ? "Завершено"
+        : `Завершено · ${formatDuration(presentation.durationMs)}`;
+    case "failed": return presentation.error ?? "Ошибка выполнения";
+    case "cancelled": return "Ход отменён";
+  }
+}
+
+function formatDuration(durationMs: number): string {
+  const seconds = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+    .format(durationMs / 1000);
+  return `${seconds} с`;
+}
+
+function turnStepKey(step: TurnStep, index: number): string {
+  return step.type === "model"
+    ? `model-${step.callIndex}`
+    : step.type === "tool"
+      ? `tool-${step.callId}`
+      : `reasoning-${step.callIndex}-${index}`;
+}
+
+function formatJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function withoutTurn(
+  turns: Readonly<Record<string, TurnPresentation>>,
+  userMessageId: string,
+): Readonly<Record<string, TurnPresentation>> {
+  const next = { ...turns };
+  delete next[userMessageId];
+  return next;
 }
 
 function appendPendingMessage(messages: SessionMessage[], pending: PendingTurn): SessionMessage[] {
@@ -118,16 +295,12 @@ function ChatTimeline({
   session,
   history,
   pending,
-  failedTurns,
-  stoppedTurns,
-  reasoningByMessage,
+  turnsByUserMessage,
 }: {
   session: SessionSummary;
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
-  failedTurns: ReadonlyMap<string, string>;
-  stoppedTurns: ReadonlySet<string>;
-  reasoningByMessage: Readonly<Record<string, string>>;
+  turnsByUserMessage: Readonly<Record<string, TurnPresentation>>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === session.id ? appendPendingMessage(messages, pending) : messages;
@@ -136,29 +309,23 @@ function ChatTimeline({
     <div className="chat-timeline">
       <div className="timeline-date"><span />{formatSessionDate(session.updatedAt)}<span /></div>
       {visibleMessages.map((message, index) => {
+        const previous = index > 0 ? visibleMessages[index - 1] : undefined;
         const next = visibleMessages[index + 1];
-        const isPending = message.id === pending?.id;
-        const status: TurnStatus | undefined = message.role !== "user"
-          ? undefined
-          : isPending
-            ? "pending"
-            : next?.role === "assistant"
-              ? "completed"
-              : stoppedTurns.has(message.id)
-                ? "cancelled"
-              : failedTurns.has(message.id)
-                ? "error"
-                : undefined;
+        const presentation = message.role === "assistant" && previous?.role === "user"
+          ? turnsByUserMessage[previous.id]
+          : undefined;
+        const standalonePresentation = message.role === "user" && next?.role !== "assistant"
+          ? turnsByUserMessage[message.id]
+          : undefined;
         return (
-          <MessageItem
-            key={message.id}
-            message={message}
-            turnStatus={status}
-            turnError={failedTurns.get(message.id)}
-            streaming={message.id === `${pending?.id}-assistant`}
-            activity={message.id === `${pending?.id}-assistant` ? pending?.activity : undefined}
-            reasoning={reasoningByMessage[message.id]}
-          />
+          <Fragment key={message.id}>
+            <MessageItem
+              message={message}
+              streaming={message.id === `${pending?.id}-assistant`}
+              presentation={presentation}
+            />
+            {standalonePresentation && <TurnTimeline presentation={standalonePresentation} />}
+          </Fragment>
         );
       })}
       {messages.length === 0 && !pending && (
@@ -172,16 +339,12 @@ function Trajectory({
   history,
   pending,
   sessionId,
-  failedTurns,
-  stoppedTurns,
-  reasoningByMessage,
+  turnsByUserMessage,
 }: {
   history: SessionHistory | undefined;
   pending: PendingTurn | null;
   sessionId: string;
-  failedTurns: ReadonlyMap<string, string>;
-  stoppedTurns: ReadonlySet<string>;
-  reasoningByMessage: Readonly<Record<string, string>>;
+  turnsByUserMessage: Readonly<Record<string, TurnPresentation>>;
 }) {
   const messages = history?.messages ?? [];
   const visibleMessages = pending?.sessionId === sessionId ? appendPendingMessage(messages, pending) : messages;
@@ -198,31 +361,25 @@ function Trajectory({
         ? <div className="empty-conversation">В этой сессии пока нет сообщений.</div>
         : <div className="trajectory-list">
           {visibleMessages.map((message, index) => {
+            const previous = index > 0 ? visibleMessages[index - 1] : undefined;
             const next = visibleMessages[index + 1];
-            const isPending = message.id === pending?.id;
-            const status: TurnStatus | undefined = message.role !== "user"
-              ? undefined
-              : isPending
-                ? "pending"
-                : next?.role === "assistant"
-                  ? "completed"
-                  : stoppedTurns.has(message.id)
-                    ? "cancelled"
-                  : failedTurns.has(message.id)
-                    ? "error"
-                    : undefined;
+            const presentation = message.role === "assistant" && previous?.role === "user"
+              ? turnsByUserMessage[previous.id]
+              : undefined;
+            const standalonePresentation = message.role === "user" && next?.role !== "assistant"
+              ? turnsByUserMessage[message.id]
+              : undefined;
             return (
               <div className="trajectory-row" key={message.id}>
                 <MessageItem
                   message={message}
                   compact
                   stepNumber={index + 1}
-                  turnStatus={status}
-                  turnError={failedTurns.get(message.id)}
                   streaming={message.id === `${pending?.id}-assistant`}
-                  activity={message.id === `${pending?.id}-assistant` ? pending?.activity : undefined}
-                  reasoning={reasoningByMessage[message.id]}
+                  presentation={presentation}
+                  detailedTimeline
                 />
+                {standalonePresentation && <TurnTimeline presentation={standalonePresentation} detailed />}
               </div>
             );
           })}
@@ -406,9 +563,7 @@ export function App() {
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(mobileBreakpoint).matches);
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia(mobileBreakpoint).matches);
   const [pending, setPending] = useState<PendingTurn | null>(null);
-  const [reasoningByMessage, setReasoningByMessage] = useState<Readonly<Record<string, string>>>({});
-  const [failedTurns, setFailedTurns] = useState<ReadonlyMap<string, string>>(() => new Map());
-  const [stoppedTurns, setStoppedTurns] = useState<ReadonlySet<string>>(() => new Set());
+  const [turnsByUserMessage, setTurnsByUserMessage] = useState<Readonly<Record<string, TurnPresentation>>>({});
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [sending, setSending] = useState(false);
@@ -501,39 +656,53 @@ export function App() {
     const previousMessageCount = historyBySession[sessionId]?.messages.length ?? 0;
     const optimisticId = `pending-${crypto.randomUUID()}`;
     const controller = new AbortController();
+    let userMessageId = optimisticId;
+    let startedAt: number | undefined;
+    let turnCompleted = false;
     setAllowDemoAdd(false);
     streamController.current = controller;
     setPending({ sessionId, id: optimisticId, text, assistantText: "", createdAt: new Date().toISOString() });
+    setTurnsByUserMessage((current) => ({ ...current, [optimisticId]: createTurnPresentation() }));
     setSending(true);
     setError("");
     try {
       const turn = await sendMessageStream(sessionId, text, {
         onStarted: (_runId, userMessage) => {
+          userMessageId = userMessage.id;
+          startedAt = performance.now();
           setPending((current) => current?.sessionId === sessionId
             ? { ...current, id: userMessage.id }
             : current);
+          setTurnsByUserMessage((current) => {
+            const { [optimisticId]: optimistic, ...rest } = current;
+            return {
+              ...rest,
+              [userMessage.id]: { ...(optimistic ?? createTurnPresentation()), status: "running" },
+            };
+          });
         },
         onTextDelta: (delta) => {
           setPending((current) => current?.sessionId === sessionId
             ? { ...current, assistantText: current.assistantText + delta }
             : current);
+          setTurnsByUserMessage((current) => ({
+            ...current,
+            [userMessageId]: markAssistantDelta(current[userMessageId] ?? createTurnPresentation()),
+          }));
         },
         onRuntimeEvent: (event, payload) => {
-          const activity = event === "tool.started"
-            ? `Выполняется ${typeof payload.name === "string" ? payload.name : "инструмент"}…`
-            : event === "tool.completed"
-              ? "Инструмент завершил работу"
-              : event === "model.started"
-                ? "Модель формирует ответ…"
-                : undefined;
-          if (activity !== undefined) {
-            setPending((current) => current?.sessionId === sessionId ? { ...current, activity } : current);
-          }
+          setTurnsByUserMessage((current) => ({
+            ...current,
+            [userMessageId]: applyTurnRuntimeEvent(current[userMessageId] ?? createTurnPresentation(), event, payload),
+          }));
         },
       }, controller.signal, allowDemoAdd ? ["demo.add"] : []);
-      if (turn.reasoning !== undefined) {
-        setReasoningByMessage((current) => ({ ...current, [turn.assistantMessage.id]: turn.reasoning! }));
-      }
+      turnCompleted = true;
+      const durationMs = startedAt === undefined ? 0 : performance.now() - startedAt;
+      setTurnsByUserMessage((current) => ({
+        ...current,
+        [turn.userMessage.id]: completeTurn(current[turn.userMessage.id] ?? createTurnPresentation(), durationMs),
+      }));
       setHistoryBySession((current) => {
         const previous = current[sessionId] ?? { session: { id: sessionId, createdAt: turn.userMessage.createdAt }, messages: [] };
         const existing = new Set(previous.messages.map((message) => message.id));
@@ -549,27 +718,18 @@ export function App() {
           },
         };
       });
-      setFailedTurns((current) => {
-        const next = new Map(current);
-        next.delete(turn.userMessage.id);
-        return next;
-      });
-      setStoppedTurns((current) => {
-        if (!current.has(turn.userMessage.id)) return current;
-        const next = new Set(current);
-        next.delete(turn.userMessage.id);
-        return next;
-      });
       setPending(null);
       setSessions(await fetchSessions());
     } catch (cause) {
       const message = errorMessage(cause);
-      if (cause instanceof WebApiError && cause.turnId) {
-        if (cause.code === "ABORTED") {
-          setStoppedTurns((current) => new Set(current).add(cause.turnId!));
-        } else {
-          setFailedTurns((current) => new Map(current).set(cause.turnId!, message));
-        }
+      if (turnCompleted) {
+        setError(message);
+      } else if (cause instanceof WebApiError && cause.turnId) {
+        const status = cause.code === "ABORTED" ? "cancelled" : "failed";
+        setTurnsByUserMessage((current) => ({
+          ...current,
+          [cause.turnId!]: failTurn(current[cause.turnId!] ?? createTurnPresentation(), status, message),
+        }));
         try {
           const history = await fetchHistory(sessionId);
           setHistoryBySession((current) => ({ ...current, [sessionId]: history }));
@@ -587,10 +747,18 @@ export function App() {
               entry.role === "user" && entry.content[0]?.text === text,
             );
             if (newUserMessage !== undefined) {
-              setStoppedTurns((current) => new Set(current).add(newUserMessage.id));
+              setTurnsByUserMessage((current) => ({
+                ...current,
+                [newUserMessage.id]: failTurn(
+                  current[newUserMessage.id] ?? createTurnPresentation(),
+                  "cancelled",
+                  message,
+                ),
+              }));
               setError("");
               setSessions(await fetchSessions());
             } else {
+              setTurnsByUserMessage((current) => withoutTurn(current, optimisticId));
               setError(message);
             }
           } catch {
@@ -598,6 +766,14 @@ export function App() {
           }
           setPending(null);
         } else {
+          if (startedAt !== undefined) {
+            setTurnsByUserMessage((current) => ({
+              ...current,
+              [userMessageId]: failTurn(current[userMessageId] ?? createTurnPresentation(), "failed", message),
+            }));
+          } else {
+            setTurnsByUserMessage((current) => withoutTurn(current, optimisticId));
+          }
           setError(message);
         }
       }
@@ -662,8 +838,8 @@ export function App() {
             ? <div className="empty-state"><Icon name="loader" size={18} />Загружаются сессии…</div>
             : selected
               ? activeTab === "chat"
-                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} failedTurns={failedTurns} stoppedTurns={stoppedTurns} reasoningByMessage={reasoningByMessage} />
-                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} failedTurns={failedTurns} stoppedTurns={stoppedTurns} reasoningByMessage={reasoningByMessage} />
+                ? <ChatTimeline session={selected} history={selectedHistory} pending={pending} turnsByUserMessage={turnsByUserMessage} />
+                : <Trajectory history={selectedHistory} pending={pending} sessionId={selected.id} turnsByUserMessage={turnsByUserMessage} />
               : <div className="empty-state"><Icon name="chat" size={20} /><strong>Начните новый диалог</strong><span>Создайте сессию, чтобы отправить запрос агенту.</span><button type="button" onClick={() => { void createNewSession(); }}>Создать чат</button></div>}
         </section>
 

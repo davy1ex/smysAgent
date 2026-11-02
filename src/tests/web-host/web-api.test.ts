@@ -293,6 +293,11 @@ test("Web SSE executes demo.add only for a tool explicitly allowed on this turn"
       "tool.started",
       "tool.completed",
       "model.started",
+      "reasoning.delta",
+      "reasoning.delta",
+      "reasoning.delta",
+      "reasoning.delta",
+      "reasoning.delta",
       "assistant.delta",
       "assistant.delta",
       "assistant.delta",
@@ -300,16 +305,30 @@ test("Web SSE executes demo.add only for a tool explicitly allowed on this turn"
       "model.completed",
       "turn.completed",
     ]);
-    const completed = events.at(-1)?.data as { assistantMessage: { content: Array<{ text: string }> }; reasoning?: string };
+    const reasoningDeltas = events.filter(({ event }) => event === "reasoning.delta");
+    assert.deepEqual(reasoningDeltas.map(({ data }) => {
+      const payload = data as { callIndex: number; text: string };
+      return [payload.callIndex, payload.text];
+    }), ["Use the ", "sum retu", "rned by ", "the tool", "."].map((text) => [2, text]));
+    const completed = events.at(-1)?.data as {
+      assistantMessage: { content: Array<{ text: string }>; reasoning?: Array<{ callIndex: number; text: string }> };
+      reasoning?: string;
+    };
     assert.equal(completed.assistantMessage.content[0]?.text, "Fake demo.add result: 5");
+    assert.deepEqual(completed.assistantMessage.reasoning, [
+      { callIndex: 2, text: "Use the sum returned by the tool." },
+    ]);
     assert.equal(completed.reasoning, "Use the sum returned by the tool.");
 
     const history = await fetch(`${baseUrl}/api/sessions/${created.sessionId}/history`).then((result) => result.json()) as {
-      messages: Array<{ role: string; content: Array<{ text: string }> }>;
+      messages: Array<{ role: string; content: Array<{ text: string }>; reasoning?: Array<{ callIndex: number; text: string }> }>;
     };
     assert.deepEqual(history.messages.map((message) => [message.role, message.content[0]?.text]), [
       ["user", "add 2 and 3"],
       ["assistant", "Fake demo.add result: 5"],
+    ]);
+    assert.deepEqual(history.messages[1]?.reasoning, [
+      { callIndex: 2, text: "Use the sum returned by the tool." },
     ]);
   } finally {
     await close(server);

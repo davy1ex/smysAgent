@@ -30,7 +30,7 @@ export class LmStudioProvider implements TextGenerationProvider {
 
   async generate(request: ModelRequest, options: ModelGenerationOptions = {}): Promise<ModelResponse> {
     options.signal?.throwIfAborted();
-    if (options.onTextDelta !== undefined) {
+    if (options.onTextDelta !== undefined || options.onReasoningDelta !== undefined) {
       return this.generateStreaming(request, options);
     }
 
@@ -136,6 +136,16 @@ export class LmStudioProvider implements TextGenerationProvider {
         if (delta === null) {
           throw new LmStudioProviderError("LM Studio returned an invalid chat completion stream.");
         }
+        if (delta.reasoning.length > 0) {
+          reasoning += delta.reasoning;
+          try {
+            await options.onReasoningDelta?.(delta.reasoning);
+          } catch (error) {
+            callbackFailed = true;
+            callbackFailure = error;
+            throw error;
+          }
+        }
         if (delta.text.length > 0) {
           text += delta.text;
           try {
@@ -146,7 +156,6 @@ export class LmStudioProvider implements TextGenerationProvider {
             throw error;
           }
         }
-        reasoning += delta.reasoning;
         for (const call of delta.toolCalls) {
           const current = toolCalls.get(call.index) ?? {
             id: "",
